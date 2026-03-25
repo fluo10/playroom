@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "playroom",
+    "playtable-core",
+    "playtable-server",
+    "playtable",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Transport
+iroh = "0.97"
+
+# Serialization
+postcard = { version = "1.1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# GUI
+bevy = "0.18"
+
+# MCP
+rmcp = { version = "1.2", features = ["server"] }
+
+# Utilities
+rand = "0.9"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+
+# Internal
+playroom = { path = "playroom" }
+playtable-core = { path = "playtable-core" }

@@ -1,0 +1,23 @@
+[package]
+name = "playtable"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "playtable"
+path = "src/main.rs"
+
+[dependencies]
+playroom = { workspace = true }
+playtable-core = { workspace = true }
+# GUI
+bevy = { workspace = true }
+# MCP
+rmcp = { workspace = true }
+# Common
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
