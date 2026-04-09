@@ -1,9 +1,23 @@
+[package]
+name = "playroom"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iroh = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+bytes = "1"
+
 [workspace]
 members = [
-    "playroom",
-    "playtable-core",
-    "playtable-server",
-    "playtable",
+    "crates/playtable-core",
+    "crates/playtable-server",
+    "crates/playtable",
 ]
 resolver = "2"
 
@@ -34,5 +48,5 @@ thiserror = "2"
 anyhow = "1"
 
 # Internal
-playroom = { path = "playroom" }
-playtable-core = { path = "playtable-core" }
+playroom = { path = "." }
+playtable-core = { path = "crates/playtable-core" }
