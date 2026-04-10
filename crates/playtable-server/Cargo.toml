@@ -8,7 +8,6 @@ name = "playtable-server"
 path = "src/main.rs"
 
 [dependencies]
-playroom = { workspace = true }
 playtable-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

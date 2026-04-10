@@ -5582,10 +5582,14 @@ dependencies = [
 name = "playtable-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "playroom",
  "rand",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5594,7 +5598,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "playroom",
  "playtable-core",
  "serde_json",
  "tokio",

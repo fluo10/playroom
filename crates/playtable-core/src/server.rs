@@ -1,6 +1,6 @@
 use anyhow::Result;
-use playtable_core::{ClientMessage, PlayerInfo, ServerMessage};
-use playtable_core::player::PlayerId;
+use crate::{ClientMessage, PlayerInfo, ServerMessage};
+use crate::player::PlayerId;
 use playroom::{EndpointAddr, NetworkNode, PeerSession};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
