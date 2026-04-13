@@ -7,10 +7,14 @@ edition = "2021"
 iroh = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }
+hex = { workspace = true }
 bytes = "1"
 
 [workspace]
@@ -37,7 +41,7 @@ tokio = { version = "1", features = ["full"] }
 bevy = "0.18"
 
 # MCP
-rmcp = { version = "1.2", features = ["server"] }
+rmcp = { version = "1.2", features = ["server", "transport-io"] }
 
 # Utilities
 rand = "0.9"
@@ -46,6 +50,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
 anyhow = "1"
+toml = "0.8"
+dirs = "6"
+hex = "0.4"
 
 # Internal
 playroom = { path = "." }

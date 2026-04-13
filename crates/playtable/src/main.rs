@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+mod cli;
 mod gui;
 mod mcp;
 
@@ -11,25 +12,28 @@ struct Cli {
     #[arg(long)]
     mcp: bool,
 
-    /// 接続先サーバーの EndpointAddr（JSON 形式）
-    #[arg(long)]
-    server: Option<String>,
+    /// CLI（readline 式）モードで起動
+    #[arg(long, name = "cli")]
+    cli_mode: bool,
 
-    /// プレイヤー名
-    #[arg(short, long, default_value = "Player")]
-    name: String,
+    /// プレイヤー名（未指定時は設定ファイルの値を使用）
+    #[arg(short, long)]
+    name: Option<String>,
 }
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let cli = Cli::parse();
+    let args = Cli::parse();
 
-    if cli.mcp {
-        let server = cli
-            .server
-            .expect("--server is required in --mcp mode");
-        tokio::runtime::Runtime::new()?.block_on(mcp::run(server, cli.name))?;
+    // 設定ファイルからデフォルト名を取得
+    let config = playroom::AppConfig::load_or_default();
+    let name = args.name.unwrap_or(config.name);
+
+    if args.mcp {
+        tokio::runtime::Runtime::new()?.block_on(mcp::run(name))?;
+    } else if args.cli_mode {
+        tokio::runtime::Runtime::new()?.block_on(cli::run(name))?;
     } else {
         gui::run();
     }
