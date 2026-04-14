@@ -16,6 +16,9 @@ toml = { workspace = true }
 dirs = { workspace = true }
 hex = { workspace = true }
 bytes = "1"
+ed25519-dalek = { workspace = true }
+serde-big-array = { workspace = true }
+getrandom = { workspace = true }
 
 [workspace]
 members = [
@@ -53,6 +56,9 @@ anyhow = "1"
 toml = "0.8"
 dirs = "6"
 hex = "0.4"
+ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
+serde-big-array = "0.5"
+getrandom = "0.3"
 
 # Internal
 playroom = { path = "." }

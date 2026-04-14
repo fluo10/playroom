@@ -2,8 +2,9 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use playroom::{
-    AppConfig, ClientMessage, EndpointAddr, EndpointId, FramedSender, HostCommand,
-    HostMessage, MemberInfo, NetworkNode, PeerSession, RoomEvent, RoomHostHandle,
+    self, AppConfig, ClientMessage, EndpointAddr, EndpointId, FramedSender, FriendEntry,
+    HostCommand, HostMessage, MemberInfo, NetworkNode, RoomEvent, RoomHostHandle, RoomSummary,
+    UserIdentity, UserPublicKeyHex,
 };
 use rmcp::model::*;
 use rmcp::service::RequestContext;
@@ -30,6 +31,7 @@ struct GuestConnection {
 
 pub struct PlaytableMcpHandler {
     name: String,
+    identity: Arc<UserIdentity>,
     inner: Mutex<HandlerInner>,
     host_handle: RoomHostHandle,
 }
@@ -42,9 +44,15 @@ struct HandlerInner {
 }
 
 impl PlaytableMcpHandler {
-    pub fn new(name: String, config: AppConfig, host_handle: RoomHostHandle) -> Self {
+    pub fn new(
+        name: String,
+        config: AppConfig,
+        identity: Arc<UserIdentity>,
+        host_handle: RoomHostHandle,
+    ) -> Self {
         Self {
             name,
+            identity,
             inner: Mutex::new(HandlerInner {
                 state: McpState::Initial,
                 config,
@@ -57,8 +65,8 @@ impl PlaytableMcpHandler {
 
     pub async fn handle_room_event(&self, event: RoomEvent) {
         let message = match &event {
-            RoomEvent::MemberJoined { name } => format!("* {name} joined the room"),
-            RoomEvent::MemberLeft { name } => format!("* {name} left the room"),
+            RoomEvent::MemberJoined { name, .. } => format!("* {name} joined the room"),
+            RoomEvent::MemberLeft { name, .. } => format!("* {name} left the room"),
             RoomEvent::ChatReceived { from, content } => format!("[chat] {from}: {content}"),
             RoomEvent::RoomCreated { name } => format!("* Room '{name}' created"),
             RoomEvent::RoomClosed => "* Room closed".to_string(),
@@ -100,7 +108,7 @@ impl PlaytableMcpHandler {
                 }
                 Some(format!("* {} joined the room", info.name))
             }
-            HostMessage::MemberLeft { name } => {
+            HostMessage::MemberLeft { name, .. } => {
                 if let Some(conn) = &mut inner.guest_conn {
                     conn.members.retain(|m| m.name != *name);
                 }
@@ -146,16 +154,16 @@ impl PlaytableMcpHandler {
                 ),
                 make_tool(
                     "join_room",
-                    "Join a friend's room",
-                    json_schema_obj(&[("friend_name", "string", "Friend name to join")]),
+                    "Join a friend's room (by petname or user public key hex)",
+                    json_schema_obj(&[("friend", "string", "Friend petname or user public key hex")]),
                 ),
                 make_tool("list_friends", "List registered friends", json_schema_empty()),
                 make_tool(
                     "add_friend",
-                    "Add a friend by EndpointId",
+                    "Add a friend by EndpointId (bootstrap address). The friend's user identity will be fetched via QueryRoom.",
                     json_schema_obj(&[
                         ("endpoint_id", "string", "Hex-encoded EndpointId (64 hex chars)"),
-                        ("name", "string", "Friend name"),
+                        ("petname", "string", "Optional nickname for the friend"),
                     ]),
                 ),
             ],
@@ -179,15 +187,23 @@ impl PlaytableMcpHandler {
         inner.peer = Some(context.peer.clone());
         let _ = context.peer.notify_tool_list_changed().await;
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Playroom started! Your EndpointId: {}",
+            "Playroom started! Your user public key: {}\nYour EndpointId: {}",
+            hex::encode(self.identity.public_key()),
             hex::encode(self.host_handle.endpoint_id.as_bytes())
         ))]))
     }
 
     async fn handle_list_rooms(&self) -> Result<CallToolResult, ErrorData> {
-        let inner = self.inner.lock().await;
-        let friends: Vec<_> = inner.config.friends.clone();
-        drop(inner);
+        let friends: Vec<FriendEntry> = {
+            let inner = self.inner.lock().await;
+            inner
+                .config
+                .friends
+                .iter()
+                .filter(|f| !f.tombstone)
+                .cloned()
+                .collect()
+        };
 
         if friends.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
@@ -196,22 +212,22 @@ impl PlaytableMcpHandler {
         }
 
         let mut handles = Vec::new();
-        for friend in &friends {
-            let endpoint_id_hex = friend.endpoint_id.clone();
-            let friend_name = friend.name.clone();
+        for friend in friends {
+            let display = friend.display_name();
             handles.push(tokio::spawn(async move {
-                let result = query_single_room(&endpoint_id_hex).await;
-                (friend_name, result)
+                let result = query_friend_room(&friend).await;
+                (display, result)
             }));
         }
 
         let mut results = Vec::new();
         for handle in handles {
-            if let Ok((_friend_name, Ok(Some((room_name, members, host_name))))) = handle.await {
+            if let Ok((friend_name, Ok(Some(summary)))) = handle.await {
                 results.push(format!(
-                    "[{host_name}] {room_name} ({} members: {})",
-                    members.len(),
-                    members.join(", ")
+                    "[{friend_name}] {} ({} members: {})",
+                    summary.name,
+                    summary.members.len(),
+                    summary.members.join(", ")
                 ));
             }
         }
@@ -249,7 +265,7 @@ impl PlaytableMcpHandler {
         let _ = context.peer.notify_tool_list_changed().await;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Room '{}' created! You are now the host. Others can join using your EndpointId: {}",
+            "Room '{}' created! Your EndpointId: {}",
             name,
             hex::encode(self.host_handle.endpoint_id.as_bytes())
         ))]))
@@ -260,95 +276,85 @@ impl PlaytableMcpHandler {
         args: &Value,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let friend_name = args
-            .get("friend_name")
+        let friend_arg = args
+            .get("friend")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ErrorData::invalid_params("friend_name is required", None))?;
+            .ok_or_else(|| ErrorData::invalid_params("friend is required", None))?;
 
-        let endpoint_id_hex = {
+        // フレンドを検索（petname 優先、見つからなければ user_public_key hex として解釈）
+        let friend = {
             let inner = self.inner.lock().await;
-            let friend = inner.config.find_friend(friend_name).ok_or_else(|| {
-                ErrorData::invalid_params(format!("Friend '{friend_name}' not found"), None)
-            })?;
-            friend.endpoint_id.clone()
-        };
+            find_friend_by_alias(&inner.config, friend_arg).cloned()
+        }
+        .ok_or_else(|| {
+            ErrorData::invalid_params(format!("Friend '{friend_arg}' not found"), None)
+        })?;
 
-        let bytes = hex::decode(&endpoint_id_hex)
-            .map_err(|e| ErrorData::internal_error(format!("Invalid hex: {e}"), None))?;
-        let bytes_arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| ErrorData::internal_error("Invalid EndpointId length", None))?;
-        let endpoint_id = EndpointId::from_bytes(&bytes_arr)
-            .map_err(|e| ErrorData::internal_error(format!("Invalid key: {e}"), None))?;
-        let addr = EndpointAddr::from(endpoint_id);
+        // 接続先 EndpointAddr: cached_self_info があればそこから、なければエラー
+        let addr = friend
+            .cached_self_info
+            .as_ref()
+            .and_then(|info| info.endpoint_addrs.first().cloned())
+            .ok_or_else(|| {
+                ErrorData::internal_error(
+                    "no known endpoint address for this friend; try list_rooms first to refresh",
+                    None,
+                )
+            })?;
 
         let node = NetworkNode::bind(None)
             .await
             .map_err(|e| ErrorData::internal_error(format!("Bind error: {e}"), None))?;
-        let mut session: PeerSession<ClientMessage<()>, HostMessage<()>> = node
-            .connect(addr)
+
+        let joined = playroom::join_room::<()>(&node, addr, &self.identity, self.name.clone())
             .await
-            .map_err(|e| ErrorData::internal_error(format!("Connection error: {e}"), None))?;
+            .map_err(|e| ErrorData::internal_error(format!("Join error: {e}"), None))?;
 
-        session
-            .send(&ClientMessage::Join {
-                name: self.name.clone(),
-            })
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("Send error: {e}"), None))?;
+        let member_list = joined
+            .members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let room_name = joined.room_name.clone();
 
-        let response = session
-            .recv()
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("Recv error: {e}"), None))?;
+        let mut inner = self.inner.lock().await;
+        // ホスト情報のキャッシュも更新しておく
+        let _ = inner.config.update_friend_self_info(joined.host_self_info);
+        let _ = inner.config.save();
 
-        match response {
-            HostMessage::Welcome {
-                room_name,
-                members,
-            } => {
-                let (sender, _receiver, _) = session.split();
-                let member_list = members
-                    .iter()
-                    .map(|m| m.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+        inner.state = McpState::InRoomGuest;
+        inner.guest_conn = Some(GuestConnection {
+            sender: joined.sender,
+            room_name: room_name.clone(),
+            members: joined.members,
+        });
+        inner.peer = Some(context.peer.clone());
+        let _ = context.peer.notify_tool_list_changed().await;
 
-                let mut inner = self.inner.lock().await;
-                inner.state = McpState::InRoomGuest;
-                inner.guest_conn = Some(GuestConnection {
-                    sender,
-                    room_name: room_name.clone(),
-                    members,
-                });
-                inner.peer = Some(context.peer.clone());
-                let _ = context.peer.notify_tool_list_changed().await;
-
-                Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Joined room '{room_name}'! Members: {member_list}"
-                ))]))
-            }
-            HostMessage::Rejected { reason } => Ok(CallToolResult::error(vec![Content::text(
-                format!("Rejected: {reason}"),
-            )])),
-            other => Ok(CallToolResult::error(vec![Content::text(format!(
-                "Unexpected response: {other:?}"
-            ))])),
-        }
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Joined room '{room_name}'! Members: {member_list}"
+        ))]))
     }
 
     async fn handle_list_friends(&self) -> Result<CallToolResult, ErrorData> {
         let inner = self.inner.lock().await;
-        if inner.config.friends.is_empty() {
+        let friends: Vec<&FriendEntry> = inner
+            .config
+            .friends
+            .iter()
+            .filter(|f| !f.tombstone)
+            .collect();
+        if friends.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 "No friends registered.",
             )]));
         }
 
         let mut lines = vec!["Friends:".to_string()];
-        for f in &inner.config.friends {
-            let short_id = &f.endpoint_id[..16.min(f.endpoint_id.len())];
-            lines.push(format!("  {} ({short_id}...)", f.name));
+        for f in friends {
+            let short = &f.user_public_key.0[..8.min(f.user_public_key.0.len())];
+            lines.push(format!("  {} (#{short})", f.display_name()));
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -361,10 +367,10 @@ impl PlaytableMcpHandler {
             .get("endpoint_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("endpoint_id is required", None))?;
-        let name = args
-            .get("name")
+        let petname = args
+            .get("petname")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ErrorData::invalid_params("name is required", None))?;
+            .map(String::from);
 
         let bytes = hex::decode(endpoint_id)
             .map_err(|e| ErrorData::invalid_params(format!("Invalid hex: {e}"), None))?;
@@ -374,16 +380,34 @@ impl PlaytableMcpHandler {
                 None,
             ));
         }
+        let mut bytes_arr = [0u8; 32];
+        bytes_arr.copy_from_slice(&bytes);
+        let eid = EndpointId::from_bytes(&bytes_arr)
+            .map_err(|e| ErrorData::invalid_params(format!("Invalid key: {e}"), None))?;
+        let addr = EndpointAddr::from(eid);
+
+        // ブートストラップ接続してフレンドのアイデンティティを取得
+        let node = NetworkNode::bind(None)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Bind error: {e}"), None))?;
+        let result = playroom::query_room::<()>(&node, addr)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Query error: {e}"), None))?;
+        node.close().await;
+
+        let key_hex = UserPublicKeyHex::from_bytes(&result.host_self_info.user_public_key);
+        let display = petname.clone().unwrap_or_else(|| result.host_self_info.name.clone());
 
         let mut inner = self.inner.lock().await;
-        inner.config.add_friend(name.to_string(), endpoint_id.to_string());
+        inner.config.upsert_friend(key_hex, petname);
+        let _ = inner.config.update_friend_self_info(result.host_self_info);
         inner
             .config
             .save()
             .map_err(|e| ErrorData::internal_error(format!("Save error: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Friend '{name}' added.",
+            "Friend '{display}' added.",
         ))]))
     }
 
@@ -578,38 +602,49 @@ fn json_schema_obj(props: &[(&str, &str, &str)]) -> Arc<JsonObject> {
     )
 }
 
-async fn query_single_room(
-    endpoint_id_hex: &str,
-) -> anyhow::Result<Option<(String, Vec<String>, String)>> {
-    let bytes = hex::decode(endpoint_id_hex)?;
-    let bytes_arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("Invalid EndpointId length"))?;
-    let endpoint_id =
-        EndpointId::from_bytes(&bytes_arr).map_err(|e| anyhow::anyhow!("Invalid key: {e}"))?;
-    let addr = EndpointAddr::from(endpoint_id);
+/// petname または user_public_key の hex プレフィックスでフレンドを探す。
+fn find_friend_by_alias<'a>(config: &'a AppConfig, alias: &str) -> Option<&'a FriendEntry> {
+    // petname 完全一致
+    if let Some(f) = config.friends.iter().find(|f| {
+        !f.tombstone && f.petname.as_deref() == Some(alias)
+    }) {
+        return Some(f);
+    }
+    // cached self info 名前一致
+    if let Some(f) = config.friends.iter().find(|f| {
+        !f.tombstone
+            && f.cached_self_info
+                .as_ref()
+                .map(|i| i.name == alias)
+                .unwrap_or(false)
+    }) {
+        return Some(f);
+    }
+    // user_public_key hex 前方一致
+    config
+        .friends
+        .iter()
+        .find(|f| !f.tombstone && f.user_public_key.0.starts_with(alias))
+}
+
+/// フレンドに対して QueryRoom を送り、ルーム情報を取得する。
+async fn query_friend_room(
+    friend: &FriendEntry,
+) -> anyhow::Result<Option<RoomSummary>> {
+    let addr = friend
+        .cached_self_info
+        .as_ref()
+        .and_then(|info| info.endpoint_addrs.first().cloned())
+        .ok_or_else(|| anyhow::anyhow!("no known endpoint address"))?;
 
     let node = NetworkNode::bind(None).await?;
-    let mut session: PeerSession<ClientMessage<()>, HostMessage<()>> =
-        tokio::time::timeout(std::time::Duration::from_secs(5), node.connect(addr))
-            .await
-            .map_err(|_| anyhow::anyhow!("Connection timeout"))??;
-
-    session.send(&ClientMessage::QueryRoom).await?;
-
-    let response = tokio::time::timeout(std::time::Duration::from_secs(5), session.recv())
-        .await
-        .map_err(|_| anyhow::anyhow!("Response timeout"))??;
-
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        playroom::query_room::<()>(&node, addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("query timeout"))??;
     node.close().await;
 
-    match response {
-        HostMessage::RoomInfo {
-            name,
-            members,
-            host_name,
-        } => Ok(Some((name, members, host_name))),
-        HostMessage::NotHosting => Ok(None),
-        _ => Ok(None),
-    }
+    Ok(result.room)
 }

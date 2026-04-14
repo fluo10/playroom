@@ -1,31 +1,42 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::framing::{FramedReceiver, FramedSender};
-use crate::protocol::{ClientMessage, HostMessage, MemberInfo};
+use crate::identity::{self, UserIdentity, UserPublicKey};
+use crate::protocol::{
+    ClientMessage, FriendSelfInfo, HostMessage, MemberInfo, RoomSummary, PROTOCOL_VERSION,
+};
 use crate::{EndpointId, NetworkNode, PeerSession};
 
 /// UI 層に公開するイベント
 #[derive(Debug, Clone)]
 pub enum RoomEvent {
-    /// メンバーが参加した
-    MemberJoined { name: String },
-    /// メンバーが退出した
-    MemberLeft { name: String },
-    /// チャットメッセージを受信した
-    ChatReceived { from: String, content: String },
-    /// ルームが作成された
-    RoomCreated { name: String },
-    /// ルームが解散された
+    MemberJoined {
+        name: String,
+        user_public_key: UserPublicKey,
+    },
+    MemberLeft {
+        name: String,
+        user_public_key: UserPublicKey,
+    },
+    ChatReceived {
+        from: String,
+        content: String,
+    },
+    RoomCreated {
+        name: String,
+    },
     RoomClosed,
 }
 
 /// ルーム内メンバーの状態（ホスト側が管理）
 struct MemberState<T: Serialize> {
     name: String,
+    user_public_key: UserPublicKey,
     sender: FramedSender<HostMessage<T>>,
 }
 
@@ -35,13 +46,22 @@ struct RoomState<T: Serialize> {
     members: HashMap<EndpointId, MemberState<T>>,
 }
 
+/// 認証済みの参加要求
+struct AuthenticatedJoin<T> {
+    endpoint_id: EndpointId,
+    name: String,
+    user_public_key: UserPublicKey,
+    sender: FramedSender<HostMessage<T>>,
+}
+
 /// accept loop からメインループへのイベント
 enum InternalEvent<T> {
-    NewConnection {
-        endpoint_id: EndpointId,
+    /// ルーム情報の問い合わせ（認証不要。応答後切断）
+    QueryRoom {
         sender: FramedSender<HostMessage<T>>,
-        first_message: ClientMessage<T>,
     },
+    /// 認証済みの新規参加
+    NewJoin(AuthenticatedJoin<T>),
     ClientMessage {
         endpoint_id: EndpointId,
         message: ClientMessage<T>,
@@ -56,17 +76,13 @@ enum InternalEvent<T> {
 pub enum HostCommand {
     CreateRoom { name: String },
     CloseRoom,
-    /// ホスト自身のチャット
     Chat { content: String },
 }
 
 /// ホストを起動する際に返されるハンドル
 pub struct RoomHostHandle {
-    /// コマンド送信用
     pub commands: mpsc::Sender<HostCommand>,
-    /// ホストの EndpointId
     pub endpoint_id: EndpointId,
-    /// ホストの EndpointAddr
     pub endpoint_addr: crate::EndpointAddr,
 }
 
@@ -76,6 +92,9 @@ where
     T: Serialize + for<'de> Deserialize<'de> + Clone + Send + 'static,
 {
     host_name: String,
+    identity: Arc<UserIdentity>,
+    host_addr: crate::EndpointAddr,
+    self_info_version: u64,
     room: Option<RoomState<T>>,
     internal_rx: mpsc::Receiver<InternalEvent<T>>,
     event_tx: mpsc::Sender<RoomEvent>,
@@ -88,9 +107,9 @@ where
     T: Serialize + for<'de> Deserialize<'de> + Clone + Send + Sync + std::fmt::Debug + 'static,
 {
     /// ノードを起動し、accept loop を開始する。
-    /// `RoomHostHandle` を返すので、UI 層はそれを使ってコマンドを送信する。
     pub async fn start(
         host_name: String,
+        identity: Arc<UserIdentity>,
         event_tx: mpsc::Sender<RoomEvent>,
     ) -> anyhow::Result<(Self, RoomHostHandle)> {
         let node = NetworkNode::bind(None).await?;
@@ -99,12 +118,14 @@ where
         let (internal_tx, internal_rx) = mpsc::channel(256);
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
 
-        // accept loop を別タスクで起動
         let accept_tx = internal_tx.clone();
         tokio::spawn(Self::accept_loop(node, accept_tx));
 
         let host = Self {
             host_name,
+            identity,
+            host_addr: endpoint_addr.clone(),
+            self_info_version: crate::config::now_unix_ms(),
             room: None,
             internal_rx,
             event_tx,
@@ -119,7 +140,6 @@ where
         Ok((host, handle))
     }
 
-    /// ルームを作成する。ホストは自動的にメンバーとなる。
     fn create_room(&mut self, name: String) {
         info!(room = %name, "Creating room");
         self.room = Some(RoomState {
@@ -129,7 +149,6 @@ where
         let _ = self.event_tx.try_send(RoomEvent::RoomCreated { name });
     }
 
-    /// ルームを解散する。全メンバーに RoomClosed を送信。
     async fn close_room(&mut self) {
         if let Some(mut room) = self.room.take() {
             info!(room = %room.room_name, "Closing room");
@@ -140,7 +159,6 @@ where
         }
     }
 
-    /// accept loop（別タスクで実行）
     async fn accept_loop(node: NetworkNode, tx: mpsc::Sender<InternalEvent<T>>) {
         loop {
             match node.accept::<HostMessage<T>, ClientMessage<T>>().await {
@@ -156,7 +174,6 @@ where
         }
     }
 
-    /// メインループ。内部イベント + コマンドを処理する。
     pub async fn run(mut self) -> anyhow::Result<()> {
         loop {
             tokio::select! {
@@ -172,38 +189,105 @@ where
         Ok(())
     }
 
-    /// 新規接続のハンドリング（最初のメッセージを読んでからイベントを送信）
+    /// 新規接続のハンドリング。
+    /// QueryRoom は即応答で終了、JoinRequest はチャレンジ認証を済ませてから内部イベントを送る。
     async fn handle_new_connection(
         session: PeerSession<HostMessage<T>, ClientMessage<T>>,
         tx: mpsc::Sender<InternalEvent<T>>,
     ) {
-        let (sender, mut receiver, endpoint_id) = session.split();
+        let (mut sender, mut receiver, endpoint_id) = session.split();
 
-        // 最初のメッセージを読む
-        match receiver.recv().await {
-            Ok(first_message) => {
-                if tx
-                    .send(InternalEvent::NewConnection {
-                        endpoint_id,
-                        sender,
-                        first_message,
-                    })
-                    .await
-                    .is_err()
-                {
+        let first = match receiver.recv().await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(peer = %endpoint_id.fmt_short(), "Failed to read first message: {e}");
+                return;
+            }
+        };
+
+        match first {
+            ClientMessage::QueryRoom => {
+                let _ = tx.send(InternalEvent::QueryRoom { sender }).await;
+            }
+            ClientMessage::JoinRequest {
+                name,
+                user_public_key,
+                protocol_version,
+            } => {
+                if protocol_version != PROTOCOL_VERSION {
+                    let _ = sender
+                        .send(&HostMessage::Rejected {
+                            reason: format!(
+                                "protocol version mismatch: expected {}, got {}",
+                                PROTOCOL_VERSION, protocol_version
+                            ),
+                        })
+                        .await;
+                    return;
+                }
+
+                // チャレンジを生成して送信
+                let mut nonce = [0u8; 32];
+                if getrandom::fill(&mut nonce).is_err() {
+                    let _ = sender
+                        .send(&HostMessage::Rejected {
+                            reason: "failed to generate nonce".into(),
+                        })
+                        .await;
+                    return;
+                }
+                if sender.send(&HostMessage::Challenge { nonce }).await.is_err() {
+                    return;
+                }
+
+                // 署名応答を待つ
+                let resp = match receiver.recv().await {
+                    Ok(ClientMessage::JoinResponse { signature }) => signature,
+                    Ok(_) => {
+                        let _ = sender
+                            .send(&HostMessage::Rejected {
+                                reason: "expected JoinResponse".into(),
+                            })
+                            .await;
+                        return;
+                    }
+                    Err(_) => return,
+                };
+
+                // 署名を検証
+                if !identity::verify_signature(&user_public_key, &nonce, &resp) {
+                    let _ = sender
+                        .send(&HostMessage::Rejected {
+                            reason: "signature verification failed".into(),
+                        })
+                        .await;
+                    return;
+                }
+
+                // 認証成功：メインループに委譲
+                let auth = AuthenticatedJoin {
+                    endpoint_id,
+                    name: name.clone(),
+                    user_public_key,
+                    sender,
+                };
+                if tx.send(InternalEvent::NewJoin(auth)).await.is_err() {
                     return;
                 }
 
                 // 以降のメッセージを転送するタスク
                 Self::client_recv_loop(endpoint_id, receiver, tx).await;
             }
-            Err(e) => {
-                warn!(peer = %endpoint_id.fmt_short(), "Failed to read first message: {e}");
+            _ => {
+                let _ = sender
+                    .send(&HostMessage::Rejected {
+                        reason: "expected QueryRoom or JoinRequest as first message".into(),
+                    })
+                    .await;
             }
         }
     }
 
-    /// クライアントの受信ループ
     async fn client_recv_loop(
         endpoint_id: EndpointId,
         mut receiver: FramedReceiver<ClientMessage<T>>,
@@ -235,39 +319,21 @@ where
 
     async fn handle_internal_event(&mut self, event: InternalEvent<T>) {
         match event {
-            InternalEvent::NewConnection {
-                endpoint_id,
-                mut sender,
-                first_message,
-            } => {
-                match first_message {
-                    ClientMessage::QueryRoom => {
-                        // ルーム情報を返して終了
-                        let msg = if let Some(room) = &self.room {
-                            let members: Vec<String> =
-                                room.members.values().map(|m| m.name.clone()).collect();
-                            HostMessage::RoomInfo {
-                                name: room.room_name.clone(),
-                                members,
-                                host_name: self.host_name.clone(),
-                            }
-                        } else {
-                            HostMessage::NotHosting
-                        };
-                        let _ = sender.send(&msg).await;
-                        // 接続は自然に切れる（sender drop）
-                    }
-                    ClientMessage::Join { name } => {
-                        self.handle_join(endpoint_id, name, sender).await;
-                    }
-                    _ => {
-                        let _ = sender
-                            .send(&HostMessage::Rejected {
-                                reason: "Expected QueryRoom or Join as first message".to_string(),
-                            })
-                            .await;
-                    }
-                }
+            InternalEvent::QueryRoom { mut sender } => {
+                let host_self_info = self.build_host_self_info();
+                let room = self.room.as_ref().map(|r| RoomSummary {
+                    name: r.room_name.clone(),
+                    members: r.members.values().map(|m| m.name.clone()).collect(),
+                });
+                let msg: HostMessage<T> = HostMessage::QueryRoomResponse {
+                    host_self_info,
+                    room,
+                };
+                let _ = sender.send(&msg).await;
+                // sender drop で切断
+            }
+            InternalEvent::NewJoin(auth) => {
+                self.handle_join(auth).await;
             }
             InternalEvent::ClientMessage {
                 endpoint_id,
@@ -281,12 +347,26 @@ where
         }
     }
 
-    async fn handle_join(
-        &mut self,
-        endpoint_id: EndpointId,
-        name: String,
-        mut sender: FramedSender<HostMessage<T>>,
-    ) {
+    /// ホスト自身の FriendSelfInfo を生成する（Welcome に同梱）。
+    fn build_host_self_info(&self) -> FriendSelfInfo {
+        FriendSelfInfo::sign_new(
+            &self.identity,
+            self.host_name.clone(),
+            vec![self.host_addr.clone()],
+            self.self_info_version,
+        )
+    }
+
+    async fn handle_join(&mut self, auth: AuthenticatedJoin<T>) {
+        let AuthenticatedJoin {
+            endpoint_id,
+            name,
+            user_public_key,
+            mut sender,
+        } = auth;
+
+        let host_self_info = self.build_host_self_info();
+
         let Some(room) = &mut self.room else {
             let _ = sender
                 .send(&HostMessage::Rejected {
@@ -296,7 +376,12 @@ where
             return;
         };
 
-        info!(peer = %endpoint_id.fmt_short(), name = %name, "Player joining room");
+        info!(
+            peer = %endpoint_id.fmt_short(),
+            name = %name,
+            user_key = %identity::short_key(&user_public_key),
+            "Player joining room"
+        );
 
         // 既存メンバー一覧を Welcome で送信
         let mut members: Vec<MemberInfo> = room
@@ -304,12 +389,14 @@ where
             .iter()
             .map(|(eid, m)| MemberInfo {
                 name: m.name.clone(),
+                user_public_key: m.user_public_key,
                 endpoint_id: eid.as_bytes().to_vec(),
             })
             .collect();
         // ホスト自身もメンバー一覧に含める
         members.push(MemberInfo {
             name: self.host_name.clone(),
+            user_public_key: self.identity.public_key(),
             endpoint_id: self.node_id.as_bytes().to_vec(),
         });
 
@@ -317,12 +404,14 @@ where
             .send(&HostMessage::Welcome {
                 room_name: room.room_name.clone(),
                 members,
+                host_self_info,
             })
             .await;
 
         // 既存メンバーに通知
         let new_member_info = MemberInfo {
             name: name.clone(),
+            user_public_key,
             endpoint_id: endpoint_id.as_bytes().to_vec(),
         };
         for member in room.members.values_mut() {
@@ -332,18 +421,19 @@ where
                 .await;
         }
 
-        // メンバー追加
         room.members.insert(
             endpoint_id,
             MemberState {
                 name: name.clone(),
+                user_public_key,
                 sender,
             },
         );
 
-        let _ = self
-            .event_tx
-            .try_send(RoomEvent::MemberJoined { name });
+        let _ = self.event_tx.try_send(RoomEvent::MemberJoined {
+            name,
+            user_public_key,
+        });
     }
 
     async fn handle_client_message(&mut self, endpoint_id: EndpointId, message: ClientMessage<T>) {
@@ -356,7 +446,6 @@ where
                     .map(|m| m.name.clone())
                     .unwrap_or_else(|| "Unknown".to_string());
 
-                // 全メンバーに broadcast（送信者以外）
                 let chat_msg = HostMessage::Chat {
                     from: from.clone(),
                     content: content.clone(),
@@ -367,7 +456,6 @@ where
                     }
                 }
 
-                // ホスト（UI）にも通知
                 let _ = self
                     .event_tx
                     .try_send(RoomEvent::ChatReceived { from, content });
@@ -376,10 +464,13 @@ where
                 self.handle_disconnect(endpoint_id).await;
             }
             ClientMessage::InRoom(_) => {
-                // 将来のゲーム別処理用。今回は無視。
+                // 将来のゲーム別処理用
+            }
+            ClientMessage::QueryRoom => {
+                // handle_new_connection 側で処理済み
             }
             _ => {
-                // QueryRoom, Join は最初のメッセージでのみ有効
+                // JoinRequest, JoinResponse はルーム外の手続きのみ
             }
         }
     }
@@ -389,17 +480,18 @@ where
         if let Some(member) = room.members.remove(&endpoint_id) {
             info!(peer = %endpoint_id.fmt_short(), name = %member.name, "Player left room");
 
-            // 他メンバーに通知
             let left_msg = HostMessage::MemberLeft {
                 name: member.name.clone(),
+                user_public_key: member.user_public_key,
             };
             for m in room.members.values_mut() {
                 let _ = m.sender.send(&left_msg).await;
             }
 
-            let _ = self
-                .event_tx
-                .try_send(RoomEvent::MemberLeft { name: member.name });
+            let _ = self.event_tx.try_send(RoomEvent::MemberLeft {
+                name: member.name,
+                user_public_key: member.user_public_key,
+            });
         }
     }
 

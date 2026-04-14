@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use playroom::{AppConfig, RoomEvent, RoomHost};
+use playroom::{AppConfig, RoomEvent, RoomHost, UserIdentity};
 use rmcp::transport;
 use rmcp::ServiceExt;
 use tokio::sync::mpsc;
@@ -10,12 +10,13 @@ mod handler;
 
 pub async fn run(name: String) -> Result<()> {
     let config = AppConfig::load_or_default();
+    let identity = Arc::new(UserIdentity::load_or_generate()?);
 
     // RoomHost を起動
     let (room_event_tx, mut room_event_rx) = mpsc::channel::<RoomEvent>(64);
-    let (host, host_handle) = RoomHost::<()>::start(name.clone(), room_event_tx).await?;
+    let (host, host_handle) =
+        RoomHost::<()>::start(name.clone(), identity.clone(), room_event_tx).await?;
 
-    // ホストをバックグラウンドで実行
     tokio::spawn(async move {
         if let Err(e) = host.run().await {
             tracing::error!("Host error: {e}");
@@ -26,6 +27,7 @@ pub async fn run(name: String) -> Result<()> {
     let mcp_handler = Arc::new(handler::PlaytableMcpHandler::new(
         name,
         config,
+        identity,
         host_handle,
     ));
 
