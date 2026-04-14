@@ -5719,6 +5719,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "data-encoding",
  "dirs",
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.4",

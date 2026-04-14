@@ -1,16 +1,14 @@
 //! デバイスペアリング（クライアント側）
 //!
-//! 新規デバイスが既存デバイスからユーザー秘密鍵・名前・フレンド/デバイス一覧を
-//! 受け取るための手順をまとめる。OTP は 6 桁数字を想定。
-//!
-//! 手順：
-//!   1. 既存デバイスが `HostCommand::OpenPairingWindow { otp, ttl }` を発行して
-//!      ウィンドウを開く
-//!   2. 新規デバイスで `pair_as_new_device(...)` を呼ぶ
-//!   3. 成功すると `PairedData` が返る。呼び出し元が AppConfig と identity.key
-//!      を保存する
+//! 既存デバイスが `Invite`（EndpointId + 短命シークレットを Base32 で連結した
+//! 固定長 77 文字のコード）を発行し、新規デバイスがそれを入力してペアリング要求
+//! を送る。成功すればユーザー秘密鍵・user_id・フレンド/デバイスリストが返される。
 
-use iroh::EndpointAddr;
+use std::fmt;
+use std::str::FromStr;
+
+use data_encoding::BASE32_NOPAD;
+use iroh::{EndpointAddr, EndpointId};
 
 use crate::client::ClientError;
 use crate::config::{AppConfig, FriendEntry, MyDeviceEntry};
@@ -18,6 +16,87 @@ use crate::identity::UserIdentity;
 use crate::protocol::{ClientMessage, HostMessage};
 use crate::session::PeerSession;
 use crate::NetworkNode;
+
+/// ペアリング招待に使う短命シークレットのバイト長（128 bit）
+pub const INVITE_SECRET_LEN: usize = 16;
+/// Invite エンコード時の文字数（固定 77 文字：48 バイトの Base32 NOPAD）
+pub const INVITE_CODE_LEN: usize = 77;
+
+/// 招待コード。既存デバイスが発行し新規デバイスに手渡す。
+///
+/// エンコード形式：`endpoint_id` 32 バイト + `secret` 16 バイトを連結した
+/// 48 バイトを BASE32_NOPAD（RFC 4648、A-Z / 2-7）でエンコードした 77 文字。
+/// 区切り文字なし、記号なしなのでダブルクリックで選択・コピーできる。
+#[derive(Debug, Clone)]
+pub struct Invite {
+    /// 招待側デバイスの EndpointId（32 バイト）
+    pub endpoint_id: [u8; 32],
+    /// 短命シークレット（128 bit）
+    pub secret: [u8; INVITE_SECRET_LEN],
+}
+
+impl Invite {
+    /// 新しい招待コードを生成する。EndpointId は呼び出し元（既存デバイス）が
+    /// 与え、secret は OS RNG から 16 バイトを取る。
+    pub fn generate(endpoint_id: [u8; 32]) -> Self {
+        let mut secret = [0u8; INVITE_SECRET_LEN];
+        getrandom::fill(&mut secret).expect("OS RNG must be available");
+        Self {
+            endpoint_id,
+            secret,
+        }
+    }
+
+    /// iroh `EndpointAddr` に変換する（接続先）
+    pub fn endpoint_addr(&self) -> Result<EndpointAddr, InviteError> {
+        let eid = EndpointId::from_bytes(&self.endpoint_id)
+            .map_err(|_| InviteError::InvalidEndpointId)?;
+        Ok(EndpointAddr::from(eid))
+    }
+}
+
+impl fmt::Display for Invite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut bytes = [0u8; 48];
+        bytes[..32].copy_from_slice(&self.endpoint_id);
+        bytes[32..].copy_from_slice(&self.secret);
+        write!(f, "{}", BASE32_NOPAD.encode(&bytes))
+    }
+}
+
+impl FromStr for Invite {
+    type Err = InviteError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() != INVITE_CODE_LEN {
+            return Err(InviteError::InvalidLength);
+        }
+        let bytes = BASE32_NOPAD
+            .decode(s.as_bytes())
+            .map_err(|_| InviteError::InvalidEncoding)?;
+        if bytes.len() != 48 {
+            return Err(InviteError::InvalidLength);
+        }
+        let mut endpoint_id = [0u8; 32];
+        let mut secret = [0u8; INVITE_SECRET_LEN];
+        endpoint_id.copy_from_slice(&bytes[..32]);
+        secret.copy_from_slice(&bytes[32..]);
+        Ok(Self {
+            endpoint_id,
+            secret,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InviteError {
+    #[error("invite code must be exactly {} characters", INVITE_CODE_LEN)]
+    InvalidLength,
+    #[error("invite code contains invalid Base32 characters")]
+    InvalidEncoding,
+    #[error("invite code embeds an invalid EndpointId")]
+    InvalidEndpointId,
+}
 
 /// ペアリング成功時に新デバイスが得るデータ
 pub struct PairedData {
@@ -27,27 +106,21 @@ pub struct PairedData {
     pub my_devices: Vec<MyDeviceEntry>,
 }
 
-/// 6 桁数字の OTP を生成する
-pub fn generate_otp() -> String {
-    let mut bytes = [0u8; 4];
-    getrandom::fill(&mut bytes).expect("OS RNG must be available");
-    let n = u32::from_le_bytes(bytes) % 1_000_000;
-    format!("{:06}", n)
-}
-
 /// 新規デバイスとして既存デバイスにペアリング要求を送り、秘密鍵と設定を受け取る。
-///
-/// この関数が返った後、呼び出し元はこのデバイスの `EndpointId` を `my_devices`
-/// に追加する責務がある（既存デバイス側でも同時に追加される）。
 pub async fn pair_as_new_device(
     node: &NetworkNode,
-    addr: EndpointAddr,
-    otp: String,
+    invite: &Invite,
     device_label: String,
 ) -> Result<PairedData, ClientError> {
+    let addr = invite
+        .endpoint_addr()
+        .map_err(|e| ClientError::Protocol(e.to_string()))?;
     let mut session: PeerSession<ClientMessage<()>, HostMessage<()>> = node.connect(addr).await?;
     session
-        .send(&ClientMessage::PairRequest { otp, device_label })
+        .send(&ClientMessage::PairRequest {
+            secret: invite.secret,
+            device_label,
+        })
         .await?;
 
     let resp = session.recv().await?;
@@ -78,7 +151,7 @@ pub async fn pair_as_new_device(
 ///   `own_endpoint_id` + `own_label` も my_devices に追加して保存する
 pub fn persist_paired_data(
     data: PairedData,
-    own_endpoint_id: &iroh::EndpointId,
+    own_endpoint_id: &EndpointId,
     own_label: String,
 ) -> anyhow::Result<()> {
     data.identity.save()?;
@@ -97,11 +170,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn otp_is_six_digits() {
-        for _ in 0..100 {
-            let otp = generate_otp();
-            assert_eq!(otp.len(), 6);
-            assert!(otp.chars().all(|c| c.is_ascii_digit()));
-        }
+    fn invite_roundtrip() {
+        let original = Invite {
+            endpoint_id: [0x42; 32],
+            secret: [0x37; INVITE_SECRET_LEN],
+        };
+        let encoded = original.to_string();
+        assert_eq!(encoded.len(), INVITE_CODE_LEN);
+        // 記号が含まれず、ダブルクリック可能であることを確認
+        assert!(encoded.chars().all(|c| c.is_ascii_alphanumeric()));
+
+        let parsed: Invite = encoded.parse().expect("round-trip");
+        assert_eq!(parsed.endpoint_id, original.endpoint_id);
+        assert_eq!(parsed.secret, original.secret);
+    }
+
+    #[test]
+    fn invite_generated_has_fixed_length() {
+        let invite = Invite::generate([1u8; 32]);
+        assert_eq!(invite.to_string().len(), INVITE_CODE_LEN);
+    }
+
+    #[test]
+    fn invite_rejects_wrong_length() {
+        assert!(matches!(
+            "SHORT".parse::<Invite>(),
+            Err(InviteError::InvalidLength)
+        ));
+    }
+
+    #[test]
+    fn invite_rejects_invalid_chars() {
+        // 77 文字だが Base32 に存在しない文字 '!' を含む
+        let bad: String = std::iter::repeat('!').take(INVITE_CODE_LEN).collect();
+        assert!(matches!(
+            bad.parse::<Invite>(),
+            Err(InviteError::InvalidEncoding)
+        ));
+    }
+
+    #[test]
+    fn invite_secret_is_random_between_generations() {
+        let a = Invite::generate([1u8; 32]);
+        let b = Invite::generate([1u8; 32]);
+        assert_ne!(a.secret, b.secret);
     }
 }

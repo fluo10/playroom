@@ -95,7 +95,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            user_id: "Player".to_string(),
+            user_id: String::new(),
             my_devices: Vec::new(),
             friends: Vec::new(),
         }
@@ -121,6 +121,12 @@ impl AppConfig {
             Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
             Err(_) => Self::default(),
         }
+    }
+
+    /// 有効な user_id（英数字 1-32 文字）が設定されているか確認する。
+    /// 未初期化の config では `user_id` が空文字列なので false を返す。
+    pub fn has_valid_user_id(&self) -> bool {
+        crate::identity::is_valid_user_id(&self.user_id)
     }
 
     pub fn save(&self) -> anyhow::Result<()> {

@@ -190,9 +190,9 @@ pub enum ClientMessage<T = ()> {
 
     // ── デバイス間ペアリング ──
     /// 新デバイスから既存デバイスへのペアリング要求（first message）。
-    /// OTP は 6 桁数字を想定。
+    /// `secret` は招待コードに埋め込まれた 128 bit 短命シークレット。
     PairRequest {
-        otp: String,
+        secret: [u8; 16],
         device_label: String,
     },
 

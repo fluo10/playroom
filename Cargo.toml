@@ -20,6 +20,7 @@ ed25519-dalek = { workspace = true }
 serde-big-array = { workspace = true }
 getrandom = { workspace = true }
 grain-id = { workspace = true }
+data-encoding = { workspace = true }
 
 [workspace]
 members = [
@@ -61,6 +62,7 @@ ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 serde-big-array = "0.5"
 getrandom = "0.3"
 grain-id = "0.15"
+data-encoding = "2"
 
 # Internal
 playroom = { path = "." }

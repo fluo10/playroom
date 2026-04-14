@@ -4,10 +4,10 @@ use std::time::Duration;
 use anyhow::Result;
 use playroom::{
     AppConfig, ClientMessage, EndpointAddr, EndpointId, FramedReceiver, FramedSender, FriendEntry,
-    HostCommand, HostMessage, MemberInfo, NetworkNode, RoomEvent, RoomHost, RoomSummary,
+    HostCommand, HostMessage, Invite, MemberInfo, NetworkNode, RoomEvent, RoomHost, RoomSummary,
     UserIdentity, UserPublicKeyHex,
 };
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::{mpsc, Mutex};
 
 enum ClientState {
@@ -20,25 +20,37 @@ enum ClientState {
     },
 }
 
-pub async fn run(name: String) -> Result<()> {
+pub async fn run() -> Result<()> {
     let config = Arc::new(Mutex::new(AppConfig::load_or_default()));
-    let identity = Arc::new(UserIdentity::load_or_generate()?);
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+
+    // 初回起動時：user_id が未設定なら新規 or 既存ユーザーの分岐を聞く
+    let already_initialized = {
+        let cfg = config.lock().await;
+        cfg.has_valid_user_id()
+    };
+
+    let identity = if already_initialized {
+        Arc::new(UserIdentity::load_or_generate()?)
+    } else {
+        bootstrap_identity(&config, &mut lines).await?
+    };
+
     let (room_event_tx, mut room_event_rx) = mpsc::channel::<RoomEvent>(64);
 
-    let (host, handle) = RoomHost::<()>::start(
-        name.clone(),
-        identity.clone(),
-        config.clone(),
-        room_event_tx,
-    )
-    .await?;
+    let (host, handle) = RoomHost::<()>::start(identity.clone(), config.clone(), room_event_tx)
+        .await?;
     let host_cmd_tx = handle.commands.clone();
     let my_endpoint_id = handle.endpoint_id;
 
     println!("=== Playroom CLI ===");
-    println!("Your name: {name}");
-    println!("Your user key: {}", hex::encode(identity.public_key()));
-    println!("Your EndpointId: {}", hex::encode(my_endpoint_id.as_bytes()));
+    {
+        let cfg = config.lock().await;
+        println!("user_id: {}", cfg.user_id);
+    }
+    println!("user key: {}", hex::encode(identity.public_key()));
+    println!("EndpointId: {}", hex::encode(my_endpoint_id.as_bytes()));
     println!();
     print_main_menu_help();
 
@@ -51,8 +63,6 @@ pub async fn run(name: String) -> Result<()> {
     let (guest_msg_tx, mut guest_msg_rx) = mpsc::channel::<HostMessage>(64);
 
     let mut state = ClientState::MainMenu;
-    let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
 
     loop {
         match &state {
@@ -131,8 +141,8 @@ pub async fn run(name: String) -> Result<()> {
                     RoomEvent::RoomClosed => {
                         println!("* Room closed");
                     }
-                    RoomEvent::PairingWindowOpened { otp } => {
-                        println!("* Pairing window open. OTP: {otp}");
+                    RoomEvent::PairingWindowOpened => {
+                        // 招待コードは pair-init コマンド側で表示済み
                     }
                     RoomEvent::PairingWindowClosed => {
                         println!("* Pairing window closed");
@@ -180,6 +190,98 @@ pub async fn run(name: String) -> Result<()> {
     Ok(())
 }
 
+/// 初回起動時、新規ユーザーか既存ユーザーかを聞き、適切に user_id と identity を確立する。
+async fn bootstrap_identity(
+    config: &Arc<Mutex<AppConfig>>,
+    lines: &mut Lines<BufReader<Stdin>>,
+) -> Result<Arc<UserIdentity>> {
+    println!("=== Playroom first-launch setup ===");
+    println!("[n]ew user (create a new identity)");
+    println!("[e]xisting user (adopt an identity from another device via invite)");
+
+    loop {
+        eprint!("Choice [n/e]: ");
+        let Some(line) = lines.next_line().await? else {
+            anyhow::bail!("stdin closed before setup completed");
+        };
+        match line.trim().to_lowercase().as_str() {
+            "n" | "new" => return bootstrap_new_user(config, lines).await,
+            "e" | "existing" => return bootstrap_existing_user(config, lines).await,
+            _ => eprintln!("Please enter 'n' or 'e'."),
+        }
+    }
+}
+
+async fn bootstrap_new_user(
+    config: &Arc<Mutex<AppConfig>>,
+    lines: &mut Lines<BufReader<Stdin>>,
+) -> Result<Arc<UserIdentity>> {
+    let user_id = loop {
+        eprint!("Enter user_id (alphanumeric, 1-32 chars): ");
+        let Some(line) = lines.next_line().await? else {
+            anyhow::bail!("stdin closed");
+        };
+        let id = line.trim().to_string();
+        if playroom::identity::is_valid_user_id(&id) {
+            break id;
+        }
+        eprintln!("Invalid user_id. Must be 1-32 ASCII alphanumeric characters.");
+    };
+
+    let identity = Arc::new(UserIdentity::load_or_generate()?);
+    let mut cfg = config.lock().await;
+    cfg.user_id = user_id.clone();
+    cfg.save()?;
+    println!("Created user '{user_id}'.");
+    Ok(identity)
+}
+
+async fn bootstrap_existing_user(
+    config: &Arc<Mutex<AppConfig>>,
+    lines: &mut Lines<BufReader<Stdin>>,
+) -> Result<Arc<UserIdentity>> {
+    let invite = loop {
+        eprint!("Paste invite code (77 chars): ");
+        let Some(line) = lines.next_line().await? else {
+            anyhow::bail!("stdin closed");
+        };
+        match line.trim().parse::<Invite>() {
+            Ok(i) => break i,
+            Err(e) => eprintln!("Invalid invite: {e}"),
+        }
+    };
+
+    eprint!("Device label (e.g. 'Laptop'): ");
+    let Some(line) = lines.next_line().await? else {
+        anyhow::bail!("stdin closed");
+    };
+    let device_label = {
+        let t = line.trim();
+        if t.is_empty() {
+            "New Device".to_string()
+        } else {
+            t.to_string()
+        }
+    };
+
+    println!("Connecting to existing device...");
+    let node = NetworkNode::bind(None).await?;
+    let own_id = node.id();
+    let data = playroom::pair_as_new_device(&node, &invite, device_label.clone()).await?;
+    node.close().await;
+
+    playroom::persist_paired_data(data, &own_id, device_label.clone())?;
+
+    // 永続化された identity.key + config を読み直す
+    let identity = Arc::new(UserIdentity::load_or_generate()?);
+    {
+        let mut cfg_in = config.lock().await;
+        *cfg_in = AppConfig::load_or_default();
+    }
+    println!("Paired successfully as '{}'.", config.lock().await.user_id);
+    Ok(identity)
+}
+
 enum CommandAction {
     Quit,
     Error(String),
@@ -220,7 +322,9 @@ async fn handle_main_menu_command(
                 let cfg = config.lock().await;
                 cfg.user_id.clone()
             };
-            match join_friend_room(config, friend_alias, identity, &player_user_id, guest_msg_tx).await {
+            match join_friend_room(config, friend_alias, identity, &player_user_id, guest_msg_tx)
+                .await
+            {
                 Ok(state) => Ok(Some(state)),
                 Err(e) => Err(CommandAction::Error(format!("Failed to join: {e}"))),
             }
@@ -240,12 +344,8 @@ async fn handle_main_menu_command(
                         (f.user_id(), key)
                     })
                     .collect();
-                let display = entries
-        .iter()
-        .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
-        .collect::<Vec<_>>();
-                for name in display {
-                    println!("  {name}");
+                for (id, pk) in &entries {
+                    println!("  {}", playroom::identity::with_key_suffix(id, pk));
                 }
             }
             Ok(None)
@@ -256,9 +356,7 @@ async fn handle_main_menu_command(
                     "Usage: add-friend <endpoint_id_hex>".into(),
                 ));
             };
-
-            let addr = parse_endpoint_addr(endpoint_id_hex)
-                .map_err(|e| CommandAction::Error(e))?;
+            let addr = parse_endpoint_addr(endpoint_id_hex).map_err(CommandAction::Error)?;
 
             let node = NetworkNode::bind(None)
                 .await
@@ -269,20 +367,20 @@ async fn handle_main_menu_command(
             node.close().await;
 
             let key_hex = UserPublicKeyHex::from_bytes(&result.host_self_info.user_public_key);
-            let display_user_id = result.host_self_info.user_id.clone();
+            let display = result.host_self_info.user_id.clone();
             let mut cfg = config.lock().await;
             cfg.upsert_friend(key_hex);
             let _ = cfg.update_friend_self_info(result.host_self_info);
             cfg.save()
                 .map_err(|e| CommandAction::Error(format!("Failed to save config: {e}")))?;
-            println!("Friend '{display_user_id}' added.");
+            println!("Friend '{display}' added.");
             Ok(None)
         }
         "devices" => {
             let cfg = config.lock().await;
             let devices: Vec<_> = cfg.my_devices.iter().filter(|d| !d.tombstone).collect();
             if devices.is_empty() {
-                println!("No devices registered. Use 'pair-init' / 'pair-complete' to pair.");
+                println!("No devices registered. Use 'pair-init' on an existing device and 'pair-device' on a new one.");
             } else {
                 println!("Your devices:");
                 for d in devices {
@@ -294,56 +392,17 @@ async fn handle_main_menu_command(
             Ok(None)
         }
         "pair-init" => {
-            let otp = playroom::generate_otp();
+            let invite = Invite::generate(*my_endpoint_id.as_bytes());
             host_cmd_tx
                 .send(HostCommand::OpenPairingWindow {
-                    otp: otp.clone(),
+                    secret: invite.secret,
                     ttl: Duration::from_secs(120),
                 })
                 .await
                 .map_err(|e| CommandAction::Error(e.to_string()))?;
             println!("Pairing window open for 120s.");
-            println!("On the new device, run:");
-            println!(
-                "  pair-complete {} {otp} <device_label>",
-                hex::encode(my_endpoint_id.as_bytes())
-            );
-            Ok(None)
-        }
-        "pair-complete" => {
-            let Some(args_str) = arg else {
-                return Err(CommandAction::Error(
-                    "Usage: pair-complete <endpoint_id_hex> <otp> [label]".into(),
-                ));
-            };
-            let parts: Vec<&str> = args_str.splitn(3, ' ').collect();
-            if parts.len() < 2 {
-                return Err(CommandAction::Error(
-                    "Usage: pair-complete <endpoint_id_hex> <otp> [label]".into(),
-                ));
-            }
-            let endpoint_id_hex = parts[0];
-            let otp = parts[1].to_string();
-            let device_label = parts.get(2).unwrap_or(&"New Device").to_string();
-
-            let addr = parse_endpoint_addr(endpoint_id_hex)
-                .map_err(|e| CommandAction::Error(e))?;
-
-            let node = NetworkNode::bind(None)
-                .await
-                .map_err(|e| CommandAction::Error(format!("Bind error: {e}")))?;
-            let own_id = node.id();
-            let data =
-                playroom::pair_as_new_device(&node, addr, otp, device_label.clone())
-                    .await
-                    .map_err(|e| CommandAction::Error(format!("Pair error: {e}")))?;
-            node.close().await;
-
-            playroom::persist_paired_data(data, &own_id, device_label.clone())
-                .map_err(|e| CommandAction::Error(format!("Persist error: {e}")))?;
-
-            println!("Paired successfully! Restart the app to use the new identity.");
-            println!("(This device is labeled '{device_label}' in your device list.)");
+            println!("On the new device (during first-launch 'existing' setup), paste:");
+            println!("  {invite}");
             Ok(None)
         }
         "sync" => {
@@ -352,8 +411,7 @@ async fn handle_main_menu_command(
                     "Usage: sync <other_device_endpoint_id_hex>".into(),
                 ));
             };
-            let addr = parse_endpoint_addr(endpoint_id_hex)
-                .map_err(|e| CommandAction::Error(e))?;
+            let addr = parse_endpoint_addr(endpoint_id_hex).map_err(CommandAction::Error)?;
 
             let node = NetworkNode::bind(None)
                 .await
@@ -465,11 +523,8 @@ async fn handle_room_guest_command(
                 .iter()
                 .map(|m| (m.user_id.clone(), m.user_public_key))
                 .collect();
-            let display = entries
-        .iter()
-        .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
-        .collect::<Vec<_>>();
-            for (m, name) in members.iter().zip(display.iter()) {
+            for (m, (_, _)) in members.iter().zip(entries.iter()) {
+                let name = playroom::identity::with_key_suffix(&m.user_id, &m.user_public_key);
                 let id_short = playroom::identity::short_bytes(&m.endpoint_id)
                     .unwrap_or_else(|| "invalid".into());
                 println!("  {name} (dev #{id_short})");
@@ -505,10 +560,10 @@ async fn query_friend_rooms(config: &Arc<Mutex<AppConfig>>) {
             (f.user_id(), key)
         })
         .collect();
-    let display_names = entries
+    let display_names: Vec<String> = entries
         .iter()
         .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
-        .collect::<Vec<_>>();
+        .collect();
 
     let mut handles = Vec::new();
     for (friend, display) in friends.into_iter().zip(display_names.into_iter()) {
@@ -577,25 +632,21 @@ async fn join_friend_room(
             anyhow::anyhow!("no known endpoint address; try 'rooms' first to refresh")
         })?;
 
-    println!("Connecting to {}...", friend.user_id());
+    let pk = friend.user_public_key.to_bytes().unwrap_or([0u8; 32]);
+    println!(
+        "Connecting to {}...",
+        playroom::identity::with_key_suffix(&friend.user_id(), &pk)
+    );
     let node = NetworkNode::bind(None).await?;
-    let joined =
-        playroom::join_room::<()>(&node, addr, identity, player_user_id.to_string()).await?;
+    let joined = playroom::join_room::<()>(&node, addr, identity, player_user_id.to_string()).await?;
 
     println!("Joined room '{}'!", joined.room_name);
     println!("Members:");
-    let entries: Vec<(String, playroom::UserPublicKey)> = joined
-        .members
-        .iter()
-        .map(|m| (m.user_id.clone(), m.user_public_key))
-        .collect();
-    let display = entries
-        .iter()
-        .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
-        .collect::<Vec<_>>();
-    for (m, name) in joined.members.iter().zip(display.iter()) {
-        let id_short = &hex::encode(&m.endpoint_id)[..16.min(m.endpoint_id.len() * 2)];
-        println!("  {name} (dev {id_short}...)");
+    for m in &joined.members {
+        let name = playroom::identity::with_key_suffix(&m.user_id, &m.user_public_key);
+        let id_short = playroom::identity::short_bytes(&m.endpoint_id)
+            .unwrap_or_else(|| "invalid".into());
+        println!("  {name} (dev #{id_short})");
     }
 
     {
@@ -615,7 +666,6 @@ async fn join_friend_room(
 }
 
 fn find_friend_by_alias<'a>(config: &'a AppConfig, alias: &str) -> Option<&'a FriendEntry> {
-    // フレンドの自己申告 user_id に完全一致
     if let Some(f) = config.friends.iter().find(|f| {
         !f.tombstone
             && f.cached_self_info
@@ -625,7 +675,6 @@ fn find_friend_by_alias<'a>(config: &'a AppConfig, alias: &str) -> Option<&'a Fr
     }) {
         return Some(f);
     }
-    // user_public_key の hex プレフィクス一致
     config
         .friends
         .iter()
@@ -664,17 +713,16 @@ async fn guest_recv_loop(
 
 fn print_main_menu_help() {
     println!("Commands:");
-    println!("  rooms              - List friends' rooms");
-    println!("  create <name>      - Create and host a room");
-    println!("  join <friend>      - Join a friend's room (petname or key hex prefix)");
-    println!("  friends            - List friends");
-    println!("  add-friend <endpoint_id_hex> [petname] - Add a friend by bootstrap EndpointId");
-    println!("  devices            - List your paired devices");
-    println!("  pair-init          - Open pairing window (existing device) to onboard a new device");
-    println!("  pair-complete <endpoint_id_hex> <otp> [label] - Adopt existing identity on this new device");
-    println!("  sync <endpoint_id_hex> - Sync with another of your own devices");
-    println!("  id                 - Show your user key and EndpointId");
-    println!("  quit               - Exit");
+    println!("  rooms                          - List friends' rooms");
+    println!("  create <name>                  - Create and host a room");
+    println!("  join <friend>                  - Join a friend's room");
+    println!("  friends                        - List friends");
+    println!("  add-friend <endpoint_id_hex>   - Add a friend by bootstrap EndpointId");
+    println!("  devices                        - List your paired devices");
+    println!("  pair-init                      - Generate an invite code for a new device");
+    println!("  sync <endpoint_id_hex>         - Sync with another of your own devices");
+    println!("  id                             - Show your user key and EndpointId");
+    println!("  quit                           - Exit");
 }
 
 fn print_room_help() {

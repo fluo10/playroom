@@ -21,7 +21,10 @@ pub use iroh::{EndpointAddr, EndpointId};
 
 // プロトコル型の再エクスポート
 pub use client::{join_room, query_room, ClientError, JoinedRoom, QueryRoomResult};
-pub use pairing::{generate_otp, pair_as_new_device, persist_paired_data, PairedData};
+pub use pairing::{
+    pair_as_new_device, persist_paired_data, Invite, InviteError, PairedData, INVITE_CODE_LEN,
+    INVITE_SECRET_LEN,
+};
 pub use protocol::{
     ClientMessage, FriendSelfInfo, HostMessage, MemberInfo, RoomSummary, SyncPayload,
     PROTOCOL_VERSION,
