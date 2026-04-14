@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use ed25519_dalek::{
     Signature, Signer, SigningKey, Verifier, VerifyingKey, SECRET_KEY_LENGTH,
 };
+use grain_id::GrainId;
 use serde::{Deserialize, Serialize};
 
 use crate::config::AppConfig;
@@ -120,14 +121,44 @@ pub fn verify_signature(
     vk.verify(message, &sig).is_ok()
 }
 
-/// 公開鍵を表示用に短縮する（先頭 4 バイト = 8 文字の hex）
+/// ユーザー公開鍵の先頭 5 バイトから GrainId（7 文字 Base32）を生成する。
 pub fn short_key(public_key: &UserPublicKey) -> String {
-    hex::encode(&public_key[..4])
+    let prefix: [u8; 5] = public_key[..5]
+        .try_into()
+        .expect("UserPublicKey is 32 bytes");
+    GrainId::from_byte_prefix(&prefix).to_string()
 }
 
-/// 表示用の名前: `Alice#a3f8b2c1`
-pub fn display_name(name: &str, public_key: &UserPublicKey) -> String {
-    format!("{}#{}", name, short_key(public_key))
+/// 32 バイトの iroh EndpointId / デバイスID など、任意のバイト列の先頭から
+/// GrainId を生成する。
+pub fn short_bytes(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 5 {
+        return None;
+    }
+    let prefix: [u8; 5] = bytes[..5].try_into().ok()?;
+    Some(GrainId::from_byte_prefix(&prefix).to_string())
+}
+
+/// hex 文字列で表されたバイト列から GrainId を生成する。
+pub fn short_bytes_from_hex(hex_str: &str) -> Option<String> {
+    let bytes = hex::decode(hex_str).ok()?;
+    short_bytes(&bytes)
+}
+
+/// `user_id#grainid` 形式で常に鍵プレフィクス付きの表示用文字列を返す。
+/// 衝突の有無にかかわらず suffix を付ける。
+pub fn with_key_suffix(user_id: &str, public_key: &UserPublicKey) -> String {
+    format!("{}#{}", user_id, short_key(public_key))
+}
+
+/// user_id の最大長
+pub const USER_ID_MAX_LEN: usize = 32;
+
+/// user_id が有効か判定する。現時点では英数字（ASCII a-zA-Z0-9）のみ、1-32 文字。
+pub fn is_valid_user_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= USER_ID_MAX_LEN
+        && id.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// シリアライズ可能な鍵ラッパ（TOML/postcard で使用）
@@ -175,9 +206,32 @@ mod tests {
     }
 
     #[test]
-    fn display_name_format() {
-        let pk = [0xa3, 0xf8, 0xb2, 0xc1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert_eq!(display_name("Alice", &pk), "Alice#a3f8b2c1");
+    fn short_key_is_seven_char_base32() {
+        let pk = [0xa3, 0xf8, 0xb2, 0xc1, 0x5d, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let s = short_key(&pk);
+        assert_eq!(s.len(), 7);
+        // 同じ入力なら再現性がある
+        assert_eq!(short_key(&pk), s);
+    }
+
+    #[test]
+    fn with_key_suffix_always_includes_suffix() {
+        let pk = [1u8; 32];
+        let display = with_key_suffix("alice", &pk);
+        assert!(display.starts_with("alice#"));
+        assert_eq!(display.split('#').count(), 2);
+    }
+
+    #[test]
+    fn user_id_validation() {
+        assert!(is_valid_user_id("alice"));
+        assert!(is_valid_user_id("Alice123"));
+        assert!(is_valid_user_id("A"));
+        assert!(!is_valid_user_id(""));
+        assert!(!is_valid_user_id("alice_bob"));   // underscore not allowed (yet)
+        assert!(!is_valid_user_id("アリス"));       // non-ASCII not allowed
+        assert!(!is_valid_user_id("alice bob"));   // space not allowed
+        assert!(!is_valid_user_id(&"x".repeat(33))); // too long
     }
 
     #[test]

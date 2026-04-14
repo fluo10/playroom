@@ -78,7 +78,7 @@ pub async fn join_room<T>(
     node: &NetworkNode,
     addr: EndpointAddr,
     identity: &UserIdentity,
-    name: String,
+    user_id: String,
 ) -> Result<JoinedRoom<T>, ClientError>
 where
     T: serde::Serialize + for<'de> serde::Deserialize<'de>,
@@ -86,7 +86,7 @@ where
     let mut session: PeerSession<ClientMessage<T>, HostMessage<T>> = node.connect(addr).await?;
     session
         .send(&ClientMessage::JoinRequest {
-            name: name.clone(),
+            user_id,
             user_public_key: identity.public_key(),
             protocol_version: PROTOCOL_VERSION,
         })

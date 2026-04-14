@@ -1,14 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
+use crate::config::{self, AppConfig};
 use crate::framing::{FramedReceiver, FramedSender};
 use crate::identity::{self, UserIdentity, UserPublicKey};
 use crate::protocol::{
-    ClientMessage, FriendSelfInfo, HostMessage, MemberInfo, RoomSummary, PROTOCOL_VERSION,
+    ClientMessage, FriendSelfInfo, HostMessage, MemberInfo, RoomSummary, SyncPayload,
+    PROTOCOL_VERSION,
 };
 use crate::{EndpointId, NetworkNode, PeerSession};
 
@@ -16,11 +19,11 @@ use crate::{EndpointId, NetworkNode, PeerSession};
 #[derive(Debug, Clone)]
 pub enum RoomEvent {
     MemberJoined {
-        name: String,
+        user_id: String,
         user_public_key: UserPublicKey,
     },
     MemberLeft {
-        name: String,
+        user_id: String,
         user_public_key: UserPublicKey,
     },
     ChatReceived {
@@ -31,11 +34,22 @@ pub enum RoomEvent {
         name: String,
     },
     RoomClosed,
+    PairingWindowOpened {
+        otp: String,
+    },
+    PairingWindowClosed,
+    PairingCompleted {
+        device_label: String,
+        device_endpoint_id: EndpointId,
+    },
+    SyncCompleted {
+        peer_endpoint_id: EndpointId,
+    },
 }
 
 /// ルーム内メンバーの状態（ホスト側が管理）
 struct MemberState<T: Serialize> {
-    name: String,
+    user_id: String,
     user_public_key: UserPublicKey,
     sender: FramedSender<HostMessage<T>>,
 }
@@ -46,22 +60,37 @@ struct RoomState<T: Serialize> {
     members: HashMap<EndpointId, MemberState<T>>,
 }
 
+/// ペアリング受け入れウィンドウ
+struct PairingWindow {
+    otp: String,
+    expires_at: Instant,
+}
+
 /// 認証済みの参加要求
 struct AuthenticatedJoin<T> {
     endpoint_id: EndpointId,
-    name: String,
+    user_id: String,
     user_public_key: UserPublicKey,
     sender: FramedSender<HostMessage<T>>,
 }
 
 /// accept loop からメインループへのイベント
 enum InternalEvent<T> {
-    /// ルーム情報の問い合わせ（認証不要。応答後切断）
     QueryRoom {
         sender: FramedSender<HostMessage<T>>,
     },
-    /// 認証済みの新規参加
     NewJoin(AuthenticatedJoin<T>),
+    PairRequest {
+        sender: FramedSender<HostMessage<T>>,
+        endpoint_id: EndpointId,
+        otp: String,
+        device_label: String,
+    },
+    SyncRequest {
+        sender: FramedSender<HostMessage<T>>,
+        endpoint_id: EndpointId,
+        payload: SyncPayload,
+    },
     ClientMessage {
         endpoint_id: EndpointId,
         message: ClientMessage<T>,
@@ -77,6 +106,10 @@ pub enum HostCommand {
     CreateRoom { name: String },
     CloseRoom,
     Chat { content: String },
+    /// ペアリングを受け入れるウィンドウを開く（OTP と TTL を指定）
+    OpenPairingWindow { otp: String, ttl: Duration },
+    /// ペアリングウィンドウを閉じる
+    ClosePairingWindow,
 }
 
 /// ホストを起動する際に返されるハンドル
@@ -91,11 +124,13 @@ pub struct RoomHost<T = ()>
 where
     T: Serialize + for<'de> Deserialize<'de> + Clone + Send + 'static,
 {
-    host_name: String,
+    host_user_id: String,
     identity: Arc<UserIdentity>,
+    config: Arc<Mutex<AppConfig>>,
     host_addr: crate::EndpointAddr,
     self_info_version: u64,
     room: Option<RoomState<T>>,
+    pairing_window: Option<PairingWindow>,
     internal_rx: mpsc::Receiver<InternalEvent<T>>,
     event_tx: mpsc::Sender<RoomEvent>,
     cmd_rx: mpsc::Receiver<HostCommand>,
@@ -108,8 +143,9 @@ where
 {
     /// ノードを起動し、accept loop を開始する。
     pub async fn start(
-        host_name: String,
+        host_user_id: String,
         identity: Arc<UserIdentity>,
+        config: Arc<Mutex<AppConfig>>,
         event_tx: mpsc::Sender<RoomEvent>,
     ) -> anyhow::Result<(Self, RoomHostHandle)> {
         let node = NetworkNode::bind(None).await?;
@@ -122,11 +158,13 @@ where
         tokio::spawn(Self::accept_loop(node, accept_tx));
 
         let host = Self {
-            host_name,
+            host_user_id,
             identity,
+            config,
             host_addr: endpoint_addr.clone(),
-            self_info_version: crate::config::now_unix_ms(),
+            self_info_version: config::now_unix_ms(),
             room: None,
+            pairing_window: None,
             internal_rx,
             event_tx,
             cmd_rx,
@@ -189,8 +227,7 @@ where
         Ok(())
     }
 
-    /// 新規接続のハンドリング。
-    /// QueryRoom は即応答で終了、JoinRequest はチャレンジ認証を済ませてから内部イベントを送る。
+    /// 新規接続のハンドリング。最初のメッセージで種類を分岐する。
     async fn handle_new_connection(
         session: PeerSession<HostMessage<T>, ClientMessage<T>>,
         tx: mpsc::Sender<InternalEvent<T>>,
@@ -210,7 +247,7 @@ where
                 let _ = tx.send(InternalEvent::QueryRoom { sender }).await;
             }
             ClientMessage::JoinRequest {
-                name,
+                user_id,
                 user_public_key,
                 protocol_version,
             } => {
@@ -226,7 +263,6 @@ where
                     return;
                 }
 
-                // チャレンジを生成して送信
                 let mut nonce = [0u8; 32];
                 if getrandom::fill(&mut nonce).is_err() {
                     let _ = sender
@@ -240,7 +276,6 @@ where
                     return;
                 }
 
-                // 署名応答を待つ
                 let resp = match receiver.recv().await {
                     Ok(ClientMessage::JoinResponse { signature }) => signature,
                     Ok(_) => {
@@ -254,7 +289,6 @@ where
                     Err(_) => return,
                 };
 
-                // 署名を検証
                 if !identity::verify_signature(&user_public_key, &nonce, &resp) {
                     let _ = sender
                         .send(&HostMessage::Rejected {
@@ -264,10 +298,9 @@ where
                     return;
                 }
 
-                // 認証成功：メインループに委譲
                 let auth = AuthenticatedJoin {
                     endpoint_id,
-                    name: name.clone(),
+                    user_id: user_id.clone(),
                     user_public_key,
                     sender,
                 };
@@ -275,13 +308,31 @@ where
                     return;
                 }
 
-                // 以降のメッセージを転送するタスク
                 Self::client_recv_loop(endpoint_id, receiver, tx).await;
+            }
+            ClientMessage::PairRequest { otp, device_label } => {
+                let _ = tx
+                    .send(InternalEvent::PairRequest {
+                        sender,
+                        endpoint_id,
+                        otp,
+                        device_label,
+                    })
+                    .await;
+            }
+            ClientMessage::SyncRequest(payload) => {
+                let _ = tx
+                    .send(InternalEvent::SyncRequest {
+                        sender,
+                        endpoint_id,
+                        payload,
+                    })
+                    .await;
             }
             _ => {
                 let _ = sender
                     .send(&HostMessage::Rejected {
-                        reason: "expected QueryRoom or JoinRequest as first message".into(),
+                        reason: "expected QueryRoom, JoinRequest, PairRequest, or SyncRequest as first message".into(),
                     })
                     .await;
             }
@@ -323,17 +374,32 @@ where
                 let host_self_info = self.build_host_self_info();
                 let room = self.room.as_ref().map(|r| RoomSummary {
                     name: r.room_name.clone(),
-                    members: r.members.values().map(|m| m.name.clone()).collect(),
+                    members: r.members.values().map(|m| m.user_id.clone()).collect(),
                 });
                 let msg: HostMessage<T> = HostMessage::QueryRoomResponse {
                     host_self_info,
                     room,
                 };
                 let _ = sender.send(&msg).await;
-                // sender drop で切断
             }
             InternalEvent::NewJoin(auth) => {
                 self.handle_join(auth).await;
+            }
+            InternalEvent::PairRequest {
+                sender,
+                endpoint_id,
+                otp,
+                device_label,
+            } => {
+                self.handle_pair_request(sender, endpoint_id, otp, device_label)
+                    .await;
+            }
+            InternalEvent::SyncRequest {
+                sender,
+                endpoint_id,
+                payload,
+            } => {
+                self.handle_sync_request(sender, endpoint_id, payload).await;
             }
             InternalEvent::ClientMessage {
                 endpoint_id,
@@ -347,11 +413,10 @@ where
         }
     }
 
-    /// ホスト自身の FriendSelfInfo を生成する（Welcome に同梱）。
     fn build_host_self_info(&self) -> FriendSelfInfo {
         FriendSelfInfo::sign_new(
             &self.identity,
-            self.host_name.clone(),
+            self.host_user_id.clone(),
             vec![self.host_addr.clone()],
             self.self_info_version,
         )
@@ -360,7 +425,7 @@ where
     async fn handle_join(&mut self, auth: AuthenticatedJoin<T>) {
         let AuthenticatedJoin {
             endpoint_id,
-            name,
+            user_id,
             user_public_key,
             mut sender,
         } = auth;
@@ -378,24 +443,22 @@ where
 
         info!(
             peer = %endpoint_id.fmt_short(),
-            name = %name,
+            user_id = %user_id,
             user_key = %identity::short_key(&user_public_key),
             "Player joining room"
         );
 
-        // 既存メンバー一覧を Welcome で送信
         let mut members: Vec<MemberInfo> = room
             .members
             .iter()
             .map(|(eid, m)| MemberInfo {
-                name: m.name.clone(),
+                user_id: m.user_id.clone(),
                 user_public_key: m.user_public_key,
                 endpoint_id: eid.as_bytes().to_vec(),
             })
             .collect();
-        // ホスト自身もメンバー一覧に含める
         members.push(MemberInfo {
-            name: self.host_name.clone(),
+            user_id: self.host_user_id.clone(),
             user_public_key: self.identity.public_key(),
             endpoint_id: self.node_id.as_bytes().to_vec(),
         });
@@ -408,9 +471,8 @@ where
             })
             .await;
 
-        // 既存メンバーに通知
         let new_member_info = MemberInfo {
-            name: name.clone(),
+            user_id: user_id.clone(),
             user_public_key,
             endpoint_id: endpoint_id.as_bytes().to_vec(),
         };
@@ -424,16 +486,128 @@ where
         room.members.insert(
             endpoint_id,
             MemberState {
-                name: name.clone(),
+                user_id: user_id.clone(),
                 user_public_key,
                 sender,
             },
         );
 
         let _ = self.event_tx.try_send(RoomEvent::MemberJoined {
-            name,
+            user_id,
             user_public_key,
         });
+    }
+
+    async fn handle_pair_request(
+        &mut self,
+        mut sender: FramedSender<HostMessage<T>>,
+        endpoint_id: EndpointId,
+        otp: String,
+        device_label: String,
+    ) {
+        // OTP 検証
+        let window = match &self.pairing_window {
+            Some(w) if w.expires_at > Instant::now() => w,
+            Some(_) => {
+                self.pairing_window = None;
+                let _ = sender
+                    .send(&HostMessage::Rejected {
+                        reason: "pairing window expired".into(),
+                    })
+                    .await;
+                let _ = self.event_tx.try_send(RoomEvent::PairingWindowClosed);
+                return;
+            }
+            None => {
+                let _ = sender
+                    .send(&HostMessage::Rejected {
+                        reason: "no pairing window open".into(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        if window.otp != otp {
+            let _ = sender
+                .send(&HostMessage::Rejected {
+                    reason: "invalid OTP".into(),
+                })
+                .await;
+            return;
+        }
+
+        // 成功：config のスナップショットと秘密鍵を送信、新デバイスを my_devices に追加
+        let (user_id, friends, my_devices) = {
+            let mut cfg = self.config.lock().await;
+            // 自デバイス側にも新規デバイスを即時登録しておく（ペアリング相互性）
+            cfg.upsert_my_device(hex::encode(endpoint_id.as_bytes()), device_label.clone());
+            let snap = (
+                cfg.user_id.clone(),
+                cfg.friends.clone(),
+                cfg.my_devices.clone(),
+            );
+            let _ = cfg.save();
+            snap
+        };
+
+        let pair_accepted = HostMessage::<T>::PairAccepted {
+            user_secret_key: self.identity.secret_bytes(),
+            user_id,
+            friends,
+            my_devices,
+        };
+        let _ = sender.send(&pair_accepted).await;
+
+        // ウィンドウを閉じる
+        self.pairing_window = None;
+        let _ = self.event_tx.try_send(RoomEvent::PairingWindowClosed);
+        let _ = self.event_tx.try_send(RoomEvent::PairingCompleted {
+            device_label,
+            device_endpoint_id: endpoint_id,
+        });
+    }
+
+    async fn handle_sync_request(
+        &mut self,
+        mut sender: FramedSender<HostMessage<T>>,
+        endpoint_id: EndpointId,
+        payload: SyncPayload,
+    ) {
+        let own_key = self.identity.public_key();
+        if !payload.verify_with(&own_key) {
+            let _ = sender
+                .send(&HostMessage::Rejected {
+                    reason: "sync signature verification failed".into(),
+                })
+                .await;
+            return;
+        }
+
+        // 相手のペイロードを自分の config にマージして、自分の新しい状態で応答する
+        let response_payload = {
+            let mut cfg = self.config.lock().await;
+            let peer_snapshot = AppConfig {
+                user_id: cfg.user_id.clone(),
+                my_devices: payload.my_devices,
+                friends: payload.friends,
+            };
+            cfg.merge_from_peer(&peer_snapshot);
+            let _ = cfg.save();
+            SyncPayload::sign_new(
+                &self.identity,
+                cfg.my_devices.clone(),
+                cfg.friends.clone(),
+            )
+        };
+
+        let _ = sender
+            .send(&HostMessage::SyncResponse(response_payload))
+            .await;
+
+        let _ = self
+            .event_tx
+            .try_send(RoomEvent::SyncCompleted { peer_endpoint_id: endpoint_id });
     }
 
     async fn handle_client_message(&mut self, endpoint_id: EndpointId, message: ClientMessage<T>) {
@@ -443,7 +617,7 @@ where
                 let from = room
                     .members
                     .get(&endpoint_id)
-                    .map(|m| m.name.clone())
+                    .map(|m| m.user_id.clone())
                     .unwrap_or_else(|| "Unknown".to_string());
 
                 let chat_msg = HostMessage::Chat {
@@ -463,14 +637,9 @@ where
             ClientMessage::Leave => {
                 self.handle_disconnect(endpoint_id).await;
             }
-            ClientMessage::InRoom(_) => {
-                // 将来のゲーム別処理用
-            }
-            ClientMessage::QueryRoom => {
-                // handle_new_connection 側で処理済み
-            }
+            ClientMessage::InRoom(_) => {}
             _ => {
-                // JoinRequest, JoinResponse はルーム外の手続きのみ
+                // QueryRoom/JoinRequest/JoinResponse/PairRequest/SyncRequest は first-message のみ
             }
         }
     }
@@ -478,10 +647,10 @@ where
     async fn handle_disconnect(&mut self, endpoint_id: EndpointId) {
         let Some(room) = &mut self.room else { return };
         if let Some(member) = room.members.remove(&endpoint_id) {
-            info!(peer = %endpoint_id.fmt_short(), name = %member.name, "Player left room");
+            info!(peer = %endpoint_id.fmt_short(), user_id = %member.user_id, "Player left room");
 
             let left_msg = HostMessage::MemberLeft {
-                name: member.name.clone(),
+                user_id: member.user_id.clone(),
                 user_public_key: member.user_public_key,
             };
             for m in room.members.values_mut() {
@@ -489,7 +658,7 @@ where
             }
 
             let _ = self.event_tx.try_send(RoomEvent::MemberLeft {
-                name: member.name,
+                user_id: member.user_id,
                 user_public_key: member.user_public_key,
             });
         }
@@ -506,11 +675,25 @@ where
             HostCommand::Chat { content } => {
                 let Some(room) = &mut self.room else { return };
                 let chat_msg = HostMessage::Chat {
-                    from: self.host_name.clone(),
+                    from: self.host_user_id.clone(),
                     content,
                 };
                 for member in room.members.values_mut() {
                     let _ = member.sender.send(&chat_msg).await;
+                }
+            }
+            HostCommand::OpenPairingWindow { otp, ttl } => {
+                self.pairing_window = Some(PairingWindow {
+                    otp: otp.clone(),
+                    expires_at: Instant::now() + ttl,
+                });
+                let _ = self
+                    .event_tx
+                    .try_send(RoomEvent::PairingWindowOpened { otp });
+            }
+            HostCommand::ClosePairingWindow => {
+                if self.pairing_window.take().is_some() {
+                    let _ = self.event_tx.try_send(RoomEvent::PairingWindowClosed);
                 }
             }
         }

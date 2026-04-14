@@ -1,9 +1,10 @@
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::time::Duration;
 
 use playroom::{
     self, AppConfig, ClientMessage, EndpointAddr, EndpointId, FramedSender, FriendEntry,
-    HostCommand, HostMessage, MemberInfo, NetworkNode, RoomEvent, RoomHostHandle, RoomSummary,
+    HostCommand, MemberInfo, NetworkNode, RoomEvent, RoomHostHandle, RoomSummary,
     UserIdentity, UserPublicKeyHex,
 };
 use rmcp::model::*;
@@ -32,13 +33,13 @@ struct GuestConnection {
 pub struct PlaytableMcpHandler {
     name: String,
     identity: Arc<UserIdentity>,
+    config: Arc<Mutex<AppConfig>>,
     inner: Mutex<HandlerInner>,
     host_handle: RoomHostHandle,
 }
 
 struct HandlerInner {
     state: McpState,
-    config: AppConfig,
     peer: Option<Peer<RoleServer>>,
     guest_conn: Option<GuestConnection>,
 }
@@ -46,16 +47,16 @@ struct HandlerInner {
 impl PlaytableMcpHandler {
     pub fn new(
         name: String,
-        config: AppConfig,
+        config: Arc<Mutex<AppConfig>>,
         identity: Arc<UserIdentity>,
         host_handle: RoomHostHandle,
     ) -> Self {
         Self {
             name,
             identity,
+            config,
             inner: Mutex::new(HandlerInner {
                 state: McpState::Initial,
-                config,
                 peer: None,
                 guest_conn: None,
             }),
@@ -65,11 +66,19 @@ impl PlaytableMcpHandler {
 
     pub async fn handle_room_event(&self, event: RoomEvent) {
         let message = match &event {
-            RoomEvent::MemberJoined { name, .. } => format!("* {name} joined the room"),
-            RoomEvent::MemberLeft { name, .. } => format!("* {name} left the room"),
+            RoomEvent::MemberJoined { user_id: name, .. } => format!("* {name} joined the room"),
+            RoomEvent::MemberLeft { user_id: name, .. } => format!("* {name} left the room"),
             RoomEvent::ChatReceived { from, content } => format!("[chat] {from}: {content}"),
             RoomEvent::RoomCreated { name } => format!("* Room '{name}' created"),
             RoomEvent::RoomClosed => "* Room closed".to_string(),
+            RoomEvent::PairingWindowOpened { otp } => {
+                format!("* Pairing window open — OTP: {otp}")
+            }
+            RoomEvent::PairingWindowClosed => "* Pairing window closed".to_string(),
+            RoomEvent::PairingCompleted { device_label, .. } => {
+                format!("* Paired with new device: {device_label}")
+            }
+            RoomEvent::SyncCompleted { .. } => "* Sync completed".to_string(),
         };
 
         let mut inner = self.inner.lock().await;
@@ -94,50 +103,6 @@ impl PlaytableMcpHandler {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn handle_guest_message(&self, msg: HostMessage) {
-        let mut inner = self.inner.lock().await;
-
-        let notification_text = match &msg {
-            HostMessage::Chat { from, content } => {
-                Some(format!("[chat] {from}: {content}"))
-            }
-            HostMessage::MemberJoined(info) => {
-                if let Some(conn) = &mut inner.guest_conn {
-                    conn.members.push(info.clone());
-                }
-                Some(format!("* {} joined the room", info.name))
-            }
-            HostMessage::MemberLeft { name, .. } => {
-                if let Some(conn) = &mut inner.guest_conn {
-                    conn.members.retain(|m| m.name != *name);
-                }
-                Some(format!("* {name} left the room"))
-            }
-            HostMessage::RoomClosed => {
-                inner.state = McpState::MainMenu;
-                inner.guest_conn = None;
-                Some("* Room closed by host".to_string())
-            }
-            _ => None,
-        };
-
-        let should_notify_tools_changed = matches!(msg, HostMessage::RoomClosed);
-
-        if let (Some(text), Some(peer)) = (notification_text, &inner.peer) {
-            let _ = peer
-                .notify_logging_message(LoggingMessageNotificationParam {
-                    level: LoggingLevel::Info,
-                    logger: Some("playroom".to_string()),
-                    data: serde_json::json!(text),
-                })
-                .await;
-            if should_notify_tools_changed {
-                let _ = peer.notify_tool_list_changed().await;
-            }
-        }
-    }
-
     fn tools_for_state(state: &McpState) -> Vec<Tool> {
         match state {
             McpState::Initial => vec![make_tool(
@@ -154,17 +119,38 @@ impl PlaytableMcpHandler {
                 ),
                 make_tool(
                     "join_room",
-                    "Join a friend's room (by petname or user public key hex)",
-                    json_schema_obj(&[("friend", "string", "Friend petname or user public key hex")]),
+                    "Join a friend's room (by user_id or user public key hex prefix)",
+                    json_schema_obj(&[("friend", "string", "Friend user_id or user public key hex prefix")]),
                 ),
                 make_tool("list_friends", "List registered friends", json_schema_empty()),
                 make_tool(
                     "add_friend",
-                    "Add a friend by EndpointId (bootstrap address). The friend's user identity will be fetched via QueryRoom.",
+                    "Add a friend by EndpointId. The friend's user identity will be fetched via QueryRoom.",
+                    json_schema_obj(&[(
+                        "endpoint_id",
+                        "string",
+                        "Hex-encoded EndpointId (64 hex chars)",
+                    )]),
+                ),
+                make_tool("list_devices", "List your own paired devices", json_schema_empty()),
+                make_tool(
+                    "pair_init",
+                    "Open a pairing window on this (existing) device. Returns an OTP to enter on the new device.",
+                    json_schema_empty(),
+                ),
+                make_tool(
+                    "pair_complete",
+                    "Use this on the NEW device to join an existing user identity. Requires the other device's EndpointId and the 6-digit OTP shown there.",
                     json_schema_obj(&[
-                        ("endpoint_id", "string", "Hex-encoded EndpointId (64 hex chars)"),
-                        ("petname", "string", "Optional nickname for the friend"),
+                        ("endpoint_id", "string", "Hex-encoded EndpointId of the existing device"),
+                        ("otp", "string", "6-digit OTP shown on the existing device"),
+                        ("device_label", "string", "Label for this new device (e.g. 'Laptop')"),
                     ]),
+                ),
+                make_tool(
+                    "sync_device",
+                    "Sync friends/devices with another of your own devices.",
+                    json_schema_obj(&[("endpoint_id", "string", "Hex-encoded EndpointId of your other device")]),
                 ),
             ],
             McpState::InRoomHost | McpState::InRoomGuest => vec![
@@ -195,14 +181,8 @@ impl PlaytableMcpHandler {
 
     async fn handle_list_rooms(&self) -> Result<CallToolResult, ErrorData> {
         let friends: Vec<FriendEntry> = {
-            let inner = self.inner.lock().await;
-            inner
-                .config
-                .friends
-                .iter()
-                .filter(|f| !f.tombstone)
-                .cloned()
-                .collect()
+            let cfg = self.config.lock().await;
+            cfg.friends.iter().filter(|f| !f.tombstone).cloned().collect()
         };
 
         if friends.is_empty() {
@@ -211,9 +191,20 @@ impl PlaytableMcpHandler {
             )]));
         }
 
+        let entries: Vec<(String, playroom::UserPublicKey)> = friends
+            .iter()
+            .map(|f| {
+                let key = f.user_public_key.to_bytes().unwrap_or([0u8; 32]);
+                (f.user_id(), key)
+            })
+            .collect();
+        let display_names = entries
+            .iter()
+            .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
+            .collect::<Vec<_>>();
+
         let mut handles = Vec::new();
-        for friend in friends {
-            let display = friend.display_name();
+        for (friend, display) in friends.into_iter().zip(display_names.into_iter()) {
             handles.push(tokio::spawn(async move {
                 let result = query_friend_room(&friend).await;
                 (display, result)
@@ -281,16 +272,14 @@ impl PlaytableMcpHandler {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("friend is required", None))?;
 
-        // フレンドを検索（petname 優先、見つからなければ user_public_key hex として解釈）
         let friend = {
-            let inner = self.inner.lock().await;
-            find_friend_by_alias(&inner.config, friend_arg).cloned()
+            let cfg = self.config.lock().await;
+            find_friend_by_alias(&cfg, friend_arg).cloned()
         }
         .ok_or_else(|| {
             ErrorData::invalid_params(format!("Friend '{friend_arg}' not found"), None)
         })?;
 
-        // 接続先 EndpointAddr: cached_self_info があればそこから、なければエラー
         let addr = friend
             .cached_self_info
             .as_ref()
@@ -310,19 +299,25 @@ impl PlaytableMcpHandler {
             .await
             .map_err(|e| ErrorData::internal_error(format!("Join error: {e}"), None))?;
 
-        let member_list = joined
+        let entries: Vec<(String, playroom::UserPublicKey)> = joined
             .members
             .iter()
-            .map(|m| m.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
+            .map(|m| (m.user_id.clone(), m.user_public_key))
+            .collect();
+        let display_names = entries
+            .iter()
+            .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
+            .collect::<Vec<_>>();
+        let member_list = display_names.join(", ");
         let room_name = joined.room_name.clone();
 
-        let mut inner = self.inner.lock().await;
-        // ホスト情報のキャッシュも更新しておく
-        let _ = inner.config.update_friend_self_info(joined.host_self_info);
-        let _ = inner.config.save();
+        {
+            let mut cfg = self.config.lock().await;
+            let _ = cfg.update_friend_self_info(joined.host_self_info);
+            let _ = cfg.save();
+        }
 
+        let mut inner = self.inner.lock().await;
         inner.state = McpState::InRoomGuest;
         inner.guest_conn = Some(GuestConnection {
             sender: joined.sender,
@@ -338,23 +333,29 @@ impl PlaytableMcpHandler {
     }
 
     async fn handle_list_friends(&self) -> Result<CallToolResult, ErrorData> {
-        let inner = self.inner.lock().await;
-        let friends: Vec<&FriendEntry> = inner
-            .config
-            .friends
-            .iter()
-            .filter(|f| !f.tombstone)
-            .collect();
+        let cfg = self.config.lock().await;
+        let friends: Vec<&FriendEntry> =
+            cfg.friends.iter().filter(|f| !f.tombstone).collect();
         if friends.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
                 "No friends registered.",
             )]));
         }
 
+        let entries: Vec<(String, playroom::UserPublicKey)> = friends
+            .iter()
+            .map(|f| {
+                let key = f.user_public_key.to_bytes().unwrap_or([0u8; 32]);
+                (f.user_id(), key)
+            })
+            .collect();
+        let display = entries
+            .iter()
+            .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
+            .collect::<Vec<_>>();
         let mut lines = vec!["Friends:".to_string()];
-        for f in friends {
-            let short = &f.user_public_key.0[..8.min(f.user_public_key.0.len())];
-            lines.push(format!("  {} (#{short})", f.display_name()));
+        for name in display {
+            lines.push(format!("  {name}"));
         }
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -367,26 +368,9 @@ impl PlaytableMcpHandler {
             .get("endpoint_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ErrorData::invalid_params("endpoint_id is required", None))?;
-        let petname = args
-            .get("petname")
-            .and_then(|v| v.as_str())
-            .map(String::from);
 
-        let bytes = hex::decode(endpoint_id)
-            .map_err(|e| ErrorData::invalid_params(format!("Invalid hex: {e}"), None))?;
-        if bytes.len() != 32 {
-            return Err(ErrorData::invalid_params(
-                "EndpointId must be 32 bytes (64 hex chars)",
-                None,
-            ));
-        }
-        let mut bytes_arr = [0u8; 32];
-        bytes_arr.copy_from_slice(&bytes);
-        let eid = EndpointId::from_bytes(&bytes_arr)
-            .map_err(|e| ErrorData::invalid_params(format!("Invalid key: {e}"), None))?;
-        let addr = EndpointAddr::from(eid);
+        let addr = parse_endpoint_addr(endpoint_id)?;
 
-        // ブートストラップ接続してフレンドのアイデンティティを取得
         let node = NetworkNode::bind(None)
             .await
             .map_err(|e| ErrorData::internal_error(format!("Bind error: {e}"), None))?;
@@ -396,19 +380,119 @@ impl PlaytableMcpHandler {
         node.close().await;
 
         let key_hex = UserPublicKeyHex::from_bytes(&result.host_self_info.user_public_key);
-        let display = petname.clone().unwrap_or_else(|| result.host_self_info.name.clone());
+        let display_user_id = result.host_self_info.user_id.clone();
 
-        let mut inner = self.inner.lock().await;
-        inner.config.upsert_friend(key_hex, petname);
-        let _ = inner.config.update_friend_self_info(result.host_self_info);
-        inner
-            .config
-            .save()
+        let mut cfg = self.config.lock().await;
+        cfg.upsert_friend(key_hex);
+        let _ = cfg.update_friend_self_info(result.host_self_info);
+        cfg.save()
             .map_err(|e| ErrorData::internal_error(format!("Save error: {e}"), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(format!(
-            "Friend '{display}' added.",
+            "Friend '{display_user_id}' added.",
         ))]))
+    }
+
+    async fn handle_list_devices(&self) -> Result<CallToolResult, ErrorData> {
+        let cfg = self.config.lock().await;
+        let devices: Vec<_> = cfg.my_devices.iter().filter(|d| !d.tombstone).collect();
+        if devices.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No devices registered. Use pair_init / pair_complete to pair your devices.",
+            )]));
+        }
+        let mut lines = vec!["Your devices:".to_string()];
+        for d in devices {
+            let short = playroom::identity::short_bytes_from_hex(&d.endpoint_id)
+                .unwrap_or_else(|| "invalid".into());
+            lines.push(format!("  {} (#{short})", d.label));
+        }
+        Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
+    }
+
+    async fn handle_pair_init(&self) -> Result<CallToolResult, ErrorData> {
+        let otp = playroom::generate_otp();
+        self.host_handle
+            .commands
+            .send(HostCommand::OpenPairingWindow {
+                otp: otp.clone(),
+                ttl: Duration::from_secs(120),
+            })
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Pairing window open for 120s.\n\
+             On the new device, run pair_complete with:\n  \
+             endpoint_id: {}\n  otp: {otp}",
+            hex::encode(self.host_handle.endpoint_id.as_bytes())
+        ))]))
+    }
+
+    async fn handle_pair_complete(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
+        let endpoint_id = args
+            .get("endpoint_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("endpoint_id is required", None))?;
+        let otp = args
+            .get("otp")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("otp is required", None))?;
+        let device_label = args
+            .get("device_label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("New Device")
+            .to_string();
+
+        let addr = parse_endpoint_addr(endpoint_id)?;
+
+        let node = NetworkNode::bind(None)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Bind error: {e}"), None))?;
+        let own_id = node.id();
+        let data = playroom::pair_as_new_device(&node, addr, otp.to_string(), device_label.clone())
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Pair error: {e}"), None))?;
+        node.close().await;
+
+        playroom::persist_paired_data(data, &own_id, device_label.clone())
+            .map_err(|e| ErrorData::internal_error(format!("Persist error: {e}"), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "Paired successfully! Restart the app to use the new identity.\n\
+             Note: this device is labeled '{device_label}' in your device list."
+        ))]))
+    }
+
+    async fn handle_sync_device(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
+        let endpoint_id = args
+            .get("endpoint_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ErrorData::invalid_params("endpoint_id is required", None))?;
+        let addr = parse_endpoint_addr(endpoint_id)?;
+
+        let node = NetworkNode::bind(None)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("Bind error: {e}"), None))?;
+
+        let outcome = {
+            let mut cfg = self.config.lock().await;
+            let outcome = playroom::sync_with_peer(&node, addr, &self.identity, &mut cfg)
+                .await
+                .map_err(|e| ErrorData::internal_error(format!("Sync error: {e}"), None))?;
+            if outcome.changed {
+                let _ = cfg.save();
+            }
+            outcome
+        };
+        node.close().await;
+
+        let msg = if outcome.changed {
+            "Sync completed with changes."
+        } else {
+            "Sync completed (no changes)."
+        };
+        Ok(CallToolResult::success(vec![Content::text(msg)]))
     }
 
     async fn handle_send_message(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
@@ -547,6 +631,10 @@ impl ServerHandler for PlaytableMcpHandler {
                 "join_room" => self.handle_join_room(&args, context).await,
                 "list_friends" => self.handle_list_friends().await,
                 "add_friend" => self.handle_add_friend(&args).await,
+                "list_devices" => self.handle_list_devices().await,
+                "pair_init" => self.handle_pair_init().await,
+                "pair_complete" => self.handle_pair_complete(&args).await,
+                "sync_device" => self.handle_sync_device(&args).await,
                 "send_message" => self.handle_send_message(&args).await,
                 "leave_room" => self.handle_leave_room(context).await,
                 _ => Err(ErrorData::method_not_found::<CallToolRequestMethod>()),
@@ -560,6 +648,22 @@ impl ServerHandler for PlaytableMcpHandler {
 }
 
 // ── Helper functions ──
+
+fn parse_endpoint_addr(endpoint_id_hex: &str) -> Result<EndpointAddr, ErrorData> {
+    let bytes = hex::decode(endpoint_id_hex)
+        .map_err(|e| ErrorData::invalid_params(format!("Invalid hex: {e}"), None))?;
+    if bytes.len() != 32 {
+        return Err(ErrorData::invalid_params(
+            "EndpointId must be 32 bytes (64 hex chars)",
+            None,
+        ));
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    let eid = EndpointId::from_bytes(&arr)
+        .map_err(|e| ErrorData::invalid_params(format!("Invalid key: {e}"), None))?;
+    Ok(EndpointAddr::from(eid))
+}
 
 fn make_tool(name: &str, description: &str, input_schema: Arc<JsonObject>) -> Tool {
     let mut tool = Tool::default();
@@ -602,35 +706,23 @@ fn json_schema_obj(props: &[(&str, &str, &str)]) -> Arc<JsonObject> {
     )
 }
 
-/// petname または user_public_key の hex プレフィックスでフレンドを探す。
 fn find_friend_by_alias<'a>(config: &'a AppConfig, alias: &str) -> Option<&'a FriendEntry> {
-    // petname 完全一致
-    if let Some(f) = config.friends.iter().find(|f| {
-        !f.tombstone && f.petname.as_deref() == Some(alias)
-    }) {
-        return Some(f);
-    }
-    // cached self info 名前一致
     if let Some(f) = config.friends.iter().find(|f| {
         !f.tombstone
             && f.cached_self_info
                 .as_ref()
-                .map(|i| i.name == alias)
+                .map(|i| i.user_id == alias)
                 .unwrap_or(false)
     }) {
         return Some(f);
     }
-    // user_public_key hex 前方一致
     config
         .friends
         .iter()
         .find(|f| !f.tombstone && f.user_public_key.0.starts_with(alias))
 }
 
-/// フレンドに対して QueryRoom を送り、ルーム情報を取得する。
-async fn query_friend_room(
-    friend: &FriendEntry,
-) -> anyhow::Result<Option<RoomSummary>> {
+async fn query_friend_room(friend: &FriendEntry) -> anyhow::Result<Option<RoomSummary>> {
     let addr = friend
         .cached_self_info
         .as_ref()

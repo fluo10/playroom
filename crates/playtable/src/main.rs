@@ -16,9 +16,9 @@ struct Cli {
     #[arg(long, name = "cli")]
     cli_mode: bool,
 
-    /// プレイヤー名（未指定時は設定ファイルの値を使用）
-    #[arg(short, long)]
-    name: Option<String>,
+    /// ユーザー ID（英数字 1-32 文字）。未指定時は設定ファイルの値を使用。
+    #[arg(short, long = "user-id")]
+    user_id: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -26,14 +26,20 @@ fn main() -> Result<()> {
 
     let args = Cli::parse();
 
-    // 設定ファイルからデフォルト名を取得
     let config = playroom::AppConfig::load_or_default();
-    let name = args.name.unwrap_or(config.name);
+    let user_id = args.user_id.unwrap_or(config.user_id);
+
+    if !playroom::identity::is_valid_user_id(&user_id) {
+        anyhow::bail!(
+            "Invalid user_id: must be 1-32 ASCII alphanumeric characters. Got: {:?}",
+            user_id
+        );
+    }
 
     if args.mcp {
-        tokio::runtime::Runtime::new()?.block_on(mcp::run(name))?;
+        tokio::runtime::Runtime::new()?.block_on(mcp::run(user_id))?;
     } else if args.cli_mode {
-        tokio::runtime::Runtime::new()?.block_on(cli::run(name))?;
+        tokio::runtime::Runtime::new()?.block_on(cli::run(user_id))?;
     } else {
         gui::run();
     }

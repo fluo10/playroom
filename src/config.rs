@@ -45,15 +45,15 @@ pub struct MyDeviceEntry {
 
 /// フレンドエントリ。
 ///
-/// - `user_public_key` / `petname` / `tombstone` / `added_at`: 自分が書き手（per-friend LWW）
+/// - `user_public_key` / `tombstone` / `added_at`: 自分が書き手（per-friend LWW）
 /// - `cached_self_info`: フレンド側が書き手（署名付き、version で単調増加）
+///
+/// フレンドの表示名（user_id）はフレンド自身が決めて `FriendSelfInfo.user_id`
+/// に持つ。自分側でニックネームは付けない設計。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FriendEntry {
     /// キー（不変、hex）
     pub user_public_key: UserPublicKeyHex,
-    /// 自分がつけたあだ名（任意）
-    #[serde(default)]
-    pub petname: Option<String>,
     /// フレンドから取得した署名付き自己情報（検証済みのみ保存）
     #[serde(default)]
     pub cached_self_info: Option<FriendSelfInfo>,
@@ -67,24 +67,23 @@ pub struct FriendEntry {
 }
 
 impl FriendEntry {
-    /// 表示名を取得する。petname があれば優先、なければ cached_self_info の name、
-    /// いずれも無ければ公開鍵の先頭を使う。
-    pub fn display_name(&self) -> String {
-        if let Some(p) = &self.petname {
-            return p.clone();
-        }
+    /// フレンドが自己申告した user_id を返す。未取得なら `Unknown#<keyPrefix>`。
+    pub fn user_id(&self) -> String {
         if let Some(info) = &self.cached_self_info {
-            return info.name.clone();
+            return info.user_id.clone();
         }
-        format!("Unknown#{}", &self.user_public_key.0[..8.min(self.user_public_key.0.len())])
+        format!(
+            "Unknown#{}",
+            &self.user_public_key.0[..8.min(self.user_public_key.0.len())]
+        )
     }
 }
 
 /// アプリケーション設定（TOML 永続化）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// 自分の表示名
-    pub name: String,
+    /// 自分の user_id（英数字 1-32 文字）
+    pub user_id: String,
     /// 自分が所有するデバイス一覧
     #[serde(default)]
     pub my_devices: Vec<MyDeviceEntry>,
@@ -96,7 +95,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            name: "Player".to_string(),
+            user_id: "Player".to_string(),
             my_devices: Vec::new(),
             friends: Vec::new(),
         }
@@ -134,21 +133,19 @@ impl AppConfig {
 
     // ── フレンド操作 ──
 
-    /// フレンドを追加する（既存なら更新）。同時に last_modified を現在時刻で更新。
-    pub fn upsert_friend(&mut self, user_public_key: UserPublicKeyHex, petname: Option<String>) {
+    /// フレンドを追加する（既存なら tombstone を解除）。last_modified を現在時刻で更新。
+    pub fn upsert_friend(&mut self, user_public_key: UserPublicKeyHex) {
         let now = now_unix_ms();
         if let Some(existing) = self
             .friends
             .iter_mut()
             .find(|f| f.user_public_key == user_public_key)
         {
-            existing.petname = petname;
             existing.tombstone = false;
             existing.last_modified = now;
         } else {
             self.friends.push(FriendEntry {
                 user_public_key,
-                petname,
                 cached_self_info: None,
                 added_at: now,
                 last_modified: now,
@@ -270,9 +267,8 @@ fn merge_friends(local: &mut Vec<FriendEntry>, remote: &[FriendEntry]) -> bool {
     for r in remote {
         match local.iter_mut().find(|l| l.user_public_key == r.user_public_key) {
             Some(l) => {
-                // メタデータ（petname, tombstone）は LWW
+                // メタデータ（tombstone）は LWW
                 if r.last_modified > l.last_modified {
-                    l.petname = r.petname.clone();
                     l.tombstone = r.tombstone;
                     l.added_at = l.added_at.min(r.added_at); // 追加時刻は古い方を保持
                     l.last_modified = r.last_modified;
@@ -327,10 +323,9 @@ mod tests {
     use crate::identity::UserIdentity;
     use crate::protocol::FriendSelfInfo;
 
-    fn make_friend(key_hex: &str, petname: Option<&str>, last_modified: u64) -> FriendEntry {
+    fn make_friend(key_hex: &str, last_modified: u64) -> FriendEntry {
         FriendEntry {
             user_public_key: UserPublicKeyHex(key_hex.to_string()),
-            petname: petname.map(String::from),
             cached_self_info: None,
             added_at: last_modified,
             last_modified,
@@ -395,16 +390,16 @@ mod tests {
     #[test]
     fn merge_friends_concurrent_additions_both_survive() {
         // A と B がオフラインで別々にフレンドを追加したシナリオ
-        let mut a = vec![make_friend("aa", Some("Alice"), 10)];
-        let b = vec![make_friend("bb", Some("Bob"), 10)];
+        let mut a = vec![make_friend("aa", 10)];
+        let b = vec![make_friend("bb", 10)];
         assert!(merge_friends(&mut a, &b));
         assert_eq!(a.len(), 2);
     }
 
     #[test]
     fn merge_friends_tombstone_wins_newer() {
-        let mut local = vec![make_friend("aa", Some("Alice"), 10)];
-        let mut remote = vec![make_friend("aa", Some("Alice"), 20)];
+        let mut local = vec![make_friend("aa", 10)];
+        let mut remote = vec![make_friend("aa", 20)];
         remote[0].tombstone = true;
         assert!(merge_friends(&mut local, &remote));
         assert!(local[0].tombstone);
@@ -415,25 +410,22 @@ mod tests {
         let id = UserIdentity::generate();
         let pk_hex = UserPublicKeyHex::from_bytes(&id.public_key());
 
-        let old = FriendSelfInfo::sign_new(&id, "Alice".into(), vec![], 1);
-        let new = FriendSelfInfo::sign_new(&id, "Alice_v2".into(), vec![], 2);
+        let old = FriendSelfInfo::sign_new(&id, "alice".into(), vec![], 1);
+        let new = FriendSelfInfo::sign_new(&id, "aliceV2".into(), vec![], 2);
 
-        let mut local_entry = FriendEntry {
+        let local_entry = FriendEntry {
             user_public_key: pk_hex.clone(),
-            petname: None,
             cached_self_info: Some(old),
             added_at: 1,
             last_modified: 1,
             tombstone: false,
         };
-        local_entry.user_public_key = pk_hex.clone();
 
         let remote_entry = FriendEntry {
             user_public_key: pk_hex,
-            petname: None,
             cached_self_info: Some(new),
             added_at: 1,
-            last_modified: 1, // last_modified 変化なし
+            last_modified: 1,
             tombstone: false,
         };
 
@@ -446,12 +438,11 @@ mod tests {
     fn merge_friends_tampered_self_info_dropped_on_new_insert() {
         let id = UserIdentity::generate();
         let pk_hex = UserPublicKeyHex::from_bytes(&id.public_key());
-        let mut tampered = FriendSelfInfo::sign_new(&id, "Alice".into(), vec![], 1);
-        tampered.name = "Mallory".into(); // 署名が無効になる
+        let mut tampered = FriendSelfInfo::sign_new(&id, "alice".into(), vec![], 1);
+        tampered.user_id = "mallory".into(); // 署名が無効になる
 
         let remote_entry = FriendEntry {
             user_public_key: pk_hex,
-            petname: None,
             cached_self_info: Some(tampered),
             added_at: 1,
             last_modified: 1,
