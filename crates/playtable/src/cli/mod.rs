@@ -5,7 +5,7 @@ use playroom::{AppConfig, HostMessage, RoomEvent};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 use tokio::sync::Mutex;
 
-use crate::service::{AppEvent, AppService, AppState};
+use playroom::service::{AppEvent, AppService, AppState};
 
 pub async fn run() -> Result<()> {
     let config = Arc::new(Mutex::new(AppConfig::load_or_default()));

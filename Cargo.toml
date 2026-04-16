@@ -3,6 +3,10 @@ name = "playroom"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+gui = ["dep:bevy", "dep:bevy_simple_text_input"]
+
 [dependencies]
 iroh = { workspace = true }
 postcard = { workspace = true }
@@ -21,6 +25,9 @@ serde-big-array = { workspace = true }
 getrandom = { workspace = true }
 grain-id = { workspace = true }
 data-encoding = { workspace = true }
+# GUI (optional)
+bevy = { workspace = true, optional = true }
+bevy_simple_text_input = { workspace = true, optional = true }
 
 [workspace]
 members = [
@@ -44,6 +51,7 @@ tokio = { version = "1", features = ["full"] }
 
 # GUI
 bevy = "0.18"
+bevy_simple_text_input = "0.14"
 
 # MCP
 rmcp = { version = "1.2", features = ["server", "transport-io"] }

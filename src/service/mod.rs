@@ -6,10 +6,10 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use playroom::{
-    self, AppConfig, ClientMessage, EndpointAddr, EndpointId, FramedReceiver, FramedSender,
-    FriendEntry, HostCommand, HostMessage, Invite, MemberInfo, NetworkNode, RoomEvent, RoomHost,
-    RoomHostHandle, UserIdentity, UserPublicKeyHex,
+use crate::{
+    self as playroom, AppConfig, ClientMessage, EndpointAddr, EndpointId, FramedReceiver,
+    FramedSender, FriendEntry, HostCommand, HostMessage, Invite, MemberInfo, NetworkNode,
+    RoomEvent, RoomHost, RoomHostHandle, UserIdentity, UserPublicKeyHex,
 };
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -652,7 +652,7 @@ async fn query_friend_room(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use playroom::AppConfig;
+    use crate::AppConfig;
 
     /// 未初期化 config からサービスを立てると、state は Uninitialized で、
     /// disk I/O は一切発生しない（has_valid_user_id が false を返すので早期 return）。

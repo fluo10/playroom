@@ -8,7 +8,7 @@ name = "playtable"
 path = "src/main.rs"
 
 [dependencies]
-playroom = { workspace = true }
+playroom = { workspace = true, features = ["gui"] }
 playtable-core = { workspace = true }
 # GUI
 bevy = { workspace = true }
@@ -22,5 +22,4 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 hex = { workspace = true }

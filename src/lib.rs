@@ -5,10 +5,13 @@ mod session;
 
 pub mod client;
 pub mod config;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod host;
 pub mod identity;
 pub mod pairing;
 pub mod protocol;
+pub mod service;
 pub mod sync;
 
 pub use endpoint::NetworkNode;

@@ -6,7 +6,7 @@ use rmcp::transport;
 use rmcp::ServiceExt;
 use tokio::sync::Mutex;
 
-use crate::service::AppService;
+use playroom::service::AppService;
 
 mod handler;
 

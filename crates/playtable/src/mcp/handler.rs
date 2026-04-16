@@ -8,7 +8,7 @@ use rmcp::{ErrorData, Peer, RoleServer, ServerHandler};
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::service::{AppError, AppEvent, AppService, AppState};
+use playroom::service::{AppError, AppEvent, AppService, AppState};
 
 pub struct PlaytableMcpHandler {
     service: Arc<AppService>,

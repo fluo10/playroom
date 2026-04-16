@@ -1,4 +1,4 @@
-use playroom::{FriendSelfInfo, HostMessage, MemberInfo, RoomEvent, UserPublicKey};
+use crate::{FriendSelfInfo, HostMessage, MemberInfo, RoomEvent, UserPublicKey};
 
 /// AppService の状態。MCP の tool セットや CLI のプロンプトを切り替える材料。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
