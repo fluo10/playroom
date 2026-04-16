@@ -4,6 +4,7 @@ use clap::Parser;
 mod cli;
 mod gui;
 mod mcp;
+mod service;
 
 #[derive(Parser)]
 #[command(name = "playtable", about = "Multiplayer tabletop games for humans and AI")]

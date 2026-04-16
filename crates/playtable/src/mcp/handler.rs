@@ -1,113 +1,77 @@
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::time::Duration;
 
-use playroom::{
-    self, AppConfig, ClientMessage, EndpointAddr, EndpointId, FramedSender, FriendEntry,
-    HostCommand, Invite, MemberInfo, NetworkNode, RoomEvent, RoomHost, RoomHostHandle, RoomSummary,
-    UserIdentity, UserPublicKeyHex,
-};
+use playroom::{HostMessage, RoomEvent};
 use rmcp::model::*;
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, Peer, RoleServer, ServerHandler};
 use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 
-/// MCP の状態
-#[derive(Debug, Clone, PartialEq)]
-enum McpState {
-    /// 未初期化（create_user / pair_device を待つ状態）
-    Uninitialized,
-    MainMenu,
-    InRoomHost,
-    InRoomGuest,
-}
-
-struct GuestConnection {
-    sender: FramedSender<ClientMessage>,
-    #[allow(dead_code)]
-    room_name: String,
-    #[allow(dead_code)]
-    members: Vec<MemberInfo>,
-}
+use crate::service::{AppError, AppEvent, AppService, AppState};
 
 pub struct PlaytableMcpHandler {
-    config: Arc<Mutex<AppConfig>>,
-    room_event_tx: mpsc::Sender<RoomEvent>,
-    inner: Mutex<HandlerInner>,
-}
-
-struct HandlerInner {
-    state: McpState,
-    peer: Option<Peer<RoleServer>>,
-    guest_conn: Option<GuestConnection>,
-    /// create_user / pair_device 成功後にセットされる
-    identity: Option<Arc<UserIdentity>>,
-    host_handle: Option<RoomHostHandle>,
-    /// RoomHost のメインループを保持（ドロップで終了）
-    _host_task: Option<tokio::task::JoinHandle<()>>,
+    service: Arc<AppService>,
+    /// AppEvent 受信側。initialize 時に purge タスクへ渡す。
+    event_rx: Mutex<Option<mpsc::Receiver<AppEvent>>>,
+    peer: Mutex<Option<Peer<RoleServer>>>,
 }
 
 impl PlaytableMcpHandler {
-    pub fn new(config: Arc<Mutex<AppConfig>>, room_event_tx: mpsc::Sender<RoomEvent>) -> Self {
-        // 既に初期化済み（config に user_id と identity.key が揃っている）なら即 MainMenu へ
-        let initial_state = McpState::Uninitialized;
+    pub fn new(service: Arc<AppService>, event_rx: mpsc::Receiver<AppEvent>) -> Self {
         Self {
-            config,
-            room_event_tx,
-            inner: Mutex::new(HandlerInner {
-                state: initial_state,
-                peer: None,
-                guest_conn: None,
-                identity: None,
-                host_handle: None,
-                _host_task: None,
-            }),
+            service,
+            event_rx: Mutex::new(Some(event_rx)),
+            peer: Mutex::new(None),
         }
     }
 
-    pub async fn handle_room_event(&self, event: RoomEvent) {
-        let message = match &event {
-            RoomEvent::MemberJoined { user_id: name, .. } => {
-                format!("* {name} joined the room")
+    async fn set_peer(&self, peer: Peer<RoleServer>) {
+        *self.peer.lock().await = Some(peer);
+    }
+
+    async fn peer(&self) -> Option<Peer<RoleServer>> {
+        self.peer.lock().await.clone()
+    }
+
+    /// AppEvent を MCP の logging / tool_list_changed に変換する常駐タスクを起動する。
+    async fn start_event_forwarder(self: Arc<Self>) {
+        let Some(mut rx) = self.event_rx.lock().await.take() else {
+            return;
+        };
+        let this = self.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                this.forward_event(event).await;
             }
-            RoomEvent::MemberLeft { user_id: name, .. } => format!("* {name} left the room"),
-            RoomEvent::ChatReceived { from, content } => format!("[chat] {from}: {content}"),
-            RoomEvent::RoomCreated { name } => format!("* Room '{name}' created"),
-            RoomEvent::RoomClosed => "* Room closed".to_string(),
-            RoomEvent::PairingWindowOpened => "* Pairing window opened".to_string(),
-            RoomEvent::PairingWindowClosed => "* Pairing window closed".to_string(),
-            RoomEvent::PairingCompleted { device_label, .. } => {
-                format!("* Paired with new device: {device_label}")
-            }
-            RoomEvent::SyncCompleted { .. } => "* Sync completed".to_string(),
+        });
+    }
+
+    async fn forward_event(&self, event: AppEvent) {
+        let peer = match self.peer().await {
+            Some(p) => p,
+            None => return,
         };
 
-        let mut inner = self.inner.lock().await;
-        if let Some(peer) = &inner.peer {
-            let _ = peer
-                .notify_logging_message(LoggingMessageNotificationParam {
-                    level: LoggingLevel::Info,
-                    logger: Some("playroom".to_string()),
-                    data: serde_json::json!(message),
-                })
-                .await;
-        }
-
-        if matches!(event, RoomEvent::RoomClosed) {
-            if inner.state == McpState::InRoomGuest || inner.state == McpState::InRoomHost {
-                inner.state = McpState::MainMenu;
-                inner.guest_conn = None;
-                if let Some(peer) = &inner.peer {
-                    let _ = peer.notify_tool_list_changed().await;
+        match event {
+            AppEvent::Room(ev) => {
+                let msg = format_room_event(&ev);
+                notify_log(&peer, &msg).await;
+            }
+            AppEvent::Guest(msg) => {
+                if let Some(text) = format_host_message(&msg) {
+                    notify_log(&peer, &text).await;
                 }
+            }
+            AppEvent::StateChanged(_) => {
+                let _ = peer.notify_tool_list_changed().await;
             }
         }
     }
 
-    fn tools_for_state(state: &McpState) -> Vec<Tool> {
+    fn tools_for_state(state: &AppState) -> Vec<Tool> {
         match state {
-            McpState::Uninitialized => vec![
+            AppState::Uninitialized => vec![
                 make_tool(
                     "create_user",
                     "Create a new user identity. Generates a fresh Ed25519 keypair and registers the given user_id.",
@@ -134,7 +98,7 @@ impl PlaytableMcpHandler {
                     ]),
                 ),
             ],
-            McpState::MainMenu => vec![
+            AppState::MainMenu => vec![
                 make_tool("list_rooms", "List rooms hosted by friends", json_schema_empty()),
                 make_tool(
                     "create_room",
@@ -172,7 +136,7 @@ impl PlaytableMcpHandler {
                     )]),
                 ),
             ],
-            McpState::InRoomHost | McpState::InRoomGuest => vec![
+            AppState::InRoomHost | AppState::InRoomGuest => vec![
                 make_tool(
                     "send_message",
                     "Send a chat message to the room",
@@ -183,525 +147,157 @@ impl PlaytableMcpHandler {
         }
     }
 
-    /// 初期化（RoomHost 起動）。identity が決まっていることを前提とする。
-    async fn start_room_host(
-        &self,
-        identity: Arc<UserIdentity>,
-    ) -> Result<RoomHostHandle, ErrorData> {
-        let (host, host_handle) =
-            RoomHost::<()>::start(identity.clone(), self.config.clone(), self.room_event_tx.clone())
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("host start: {e}"), None))?;
-        let task = tokio::spawn(async move {
-            if let Err(e) = host.run().await {
-                tracing::error!("Host error: {e}");
-            }
-        });
-        let mut inner = self.inner.lock().await;
-        inner.identity = Some(identity);
-        inner.host_handle = Some(host_handle.clone());
-        inner._host_task = Some(task);
-        inner.state = McpState::MainMenu;
-        Ok(host_handle)
+    async fn handle_create_user(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
+        let user_id = require_str(args, "user_id")?;
+        let result = self.service.create_user(user_id).await.map_err(map_err)?;
+        Ok(ok_text(format!(
+            "User created.\nuser_id: {}\nuser_public_key: {}\nEndpointId: {}",
+            result.user_id,
+            hex::encode(result.user_public_key),
+            hex::encode(result.endpoint_id),
+        )))
     }
 
-    fn require_initialized<'a>(
-        inner: &'a HandlerInner,
-    ) -> Result<(Arc<UserIdentity>, &'a RoomHostHandle), ErrorData> {
-        match (&inner.identity, &inner.host_handle) {
-            (Some(id), Some(h)) => Ok((id.clone(), h)),
-            _ => Err(ErrorData::invalid_params(
-                "not initialized; call create_user or pair_device first",
-                None,
-            )),
-        }
-    }
-
-    async fn handle_create_user(
-        &self,
-        args: &Value,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let user_id = args
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ErrorData::invalid_params("user_id is required", None))?;
-
-        if !playroom::identity::is_valid_user_id(user_id) {
-            return Err(ErrorData::invalid_params(
-                "user_id must be 1-32 ASCII alphanumeric characters",
-                None,
-            ));
-        }
-
-        // 既に RoomHost 起動済みなら拒否（何らかの矛盾）
-        {
-            let inner = self.inner.lock().await;
-            if inner.host_handle.is_some() {
-                return Err(ErrorData::invalid_params("already initialized", None));
-            }
-        }
-
-        // identity.key がなければ生成、あれば既存を使う（通常は前者）
-        let identity = Arc::new(
-            UserIdentity::load_or_generate()
-                .map_err(|e| ErrorData::internal_error(format!("identity: {e}"), None))?,
-        );
-
-        {
-            let mut cfg = self.config.lock().await;
-            cfg.user_id = user_id.to_string();
-            cfg.save()
-                .map_err(|e| ErrorData::internal_error(format!("save: {e}"), None))?;
-        }
-
-        self.start_room_host(identity.clone()).await?;
-
-        let mut inner = self.inner.lock().await;
-        inner.peer = Some(context.peer.clone());
-        let _ = context.peer.notify_tool_list_changed().await;
-
-        let handle = inner.host_handle.as_ref().unwrap();
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "User created.\nuser_id: {user_id}\nuser_public_key: {}\nEndpointId: {}",
-            hex::encode(identity.public_key()),
-            hex::encode(handle.endpoint_id.as_bytes()),
-        ))]))
-    }
-
-    async fn handle_pair_device(
-        &self,
-        args: &Value,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let invite_code = args
-            .get("invite_code")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ErrorData::invalid_params("invite_code is required", None))?;
+    async fn handle_pair_device(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
+        let invite_code = require_str(args, "invite_code")?;
         let device_label = args
             .get("device_label")
             .and_then(|v| v.as_str())
-            .unwrap_or("New Device")
-            .to_string();
+            .unwrap_or("New Device");
 
-        // 既に初期化済みなら拒否
-        {
-            let inner = self.inner.lock().await;
-            if inner.host_handle.is_some() {
-                return Err(ErrorData::invalid_params("already initialized", None));
-            }
-        }
-
-        let invite: Invite = invite_code
-            .parse()
-            .map_err(|e| ErrorData::invalid_params(format!("invalid invite code: {e}"), None))?;
-
-        let node = NetworkNode::bind(None)
+        let result = self
+            .service
+            .pair_device(invite_code, device_label)
             .await
-            .map_err(|e| ErrorData::internal_error(format!("bind: {e}"), None))?;
-        let own_id = node.id();
-        let data =
-            playroom::pair_as_new_device(&node, &invite, device_label.clone())
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("pair: {e}"), None))?;
-        node.close().await;
-
-        playroom::persist_paired_data(data, &own_id, device_label.clone())
-            .map_err(|e| ErrorData::internal_error(format!("persist: {e}"), None))?;
-
-        // 新しい identity.key からロード
-        let identity = Arc::new(
-            UserIdentity::load_or_generate()
-                .map_err(|e| ErrorData::internal_error(format!("identity: {e}"), None))?,
-        );
-        self.start_room_host(identity.clone()).await?;
-
-        let mut inner = self.inner.lock().await;
-        inner.peer = Some(context.peer.clone());
-        let _ = context.peer.notify_tool_list_changed().await;
-
-        let user_id = self.config.lock().await.user_id.clone();
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Paired successfully.\nuser_id: {user_id}\nuser_public_key: {}\nDevice labeled '{device_label}'.",
-            hex::encode(identity.public_key()),
-        ))]))
+            .map_err(map_err)?;
+        Ok(ok_text(format!(
+            "Paired successfully.\nuser_id: {}\nuser_public_key: {}\nDevice labeled '{}'.",
+            result.user_id,
+            hex::encode(result.user_public_key),
+            result.device_label,
+        )))
     }
 
     async fn handle_list_rooms(&self) -> Result<CallToolResult, ErrorData> {
-        let friends: Vec<FriendEntry> = {
-            let cfg = self.config.lock().await;
-            cfg.friends.iter().filter(|f| !f.tombstone).cloned().collect()
-        };
-
-        if friends.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No friends registered. Use add_friend to add friends first.",
-            )]));
-        }
-
-        let entries: Vec<(String, playroom::UserPublicKey)> = friends
-            .iter()
-            .map(|f| {
-                let key = f.user_public_key.to_bytes().unwrap_or([0u8; 32]);
-                (f.user_id(), key)
-            })
-            .collect();
-        let display_names = entries
-            .iter()
-            .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
-            .collect::<Vec<_>>();
-
-        let mut handles = Vec::new();
-        for (friend, display) in friends.into_iter().zip(display_names.into_iter()) {
-            handles.push(tokio::spawn(async move {
-                let result = query_friend_room(&friend).await;
-                (display, result)
-            }));
-        }
-
-        let mut results = Vec::new();
-        for handle in handles {
-            if let Ok((friend_name, Ok(Some(summary)))) = handle.await {
-                results.push(format!(
-                    "[{friend_name}] {} ({} members: {})",
-                    summary.name,
-                    summary.members.len(),
-                    summary.members.join(", ")
-                ));
-            }
-        }
-
-        let text = if results.is_empty() {
+        let listing = self.service.list_rooms().await.map_err(map_err)?;
+        let text = if listing.rooms.is_empty() {
             "No rooms found.".to_string()
         } else {
-            format!("Available rooms:\n{}", results.join("\n"))
+            let lines: Vec<String> = listing
+                .rooms
+                .iter()
+                .map(|r| {
+                    format!(
+                        "[{}] {} ({} members: {})",
+                        r.friend_display,
+                        r.room_name,
+                        r.members.len(),
+                        r.members.join(", ")
+                    )
+                })
+                .collect();
+            format!("Available rooms:\n{}", lines.join("\n"))
         };
-
-        Ok(CallToolResult::success(vec![Content::text(text)]))
+        Ok(ok_text(text))
     }
 
-    async fn handle_create_room(
-        &self,
-        args: &Value,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let name = args
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("My Room");
-
-        let mut inner = self.inner.lock().await;
-        let (_, handle) = Self::require_initialized(&inner)?;
-
-        handle
-            .commands
-            .send(HostCommand::CreateRoom {
-                name: name.to_string(),
-            })
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        let endpoint_id_hex = hex::encode(handle.endpoint_id.as_bytes());
-        inner.state = McpState::InRoomHost;
-        inner.peer = Some(context.peer.clone());
-        let _ = context.peer.notify_tool_list_changed().await;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
+    async fn handle_create_room(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
+        let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("My Room");
+        let created = self.service.create_room(name).await.map_err(map_err)?;
+        Ok(ok_text(format!(
             "Room '{}' created! Your EndpointId: {}",
-            name, endpoint_id_hex
-        ))]))
+            created.name,
+            hex::encode(created.endpoint_id),
+        )))
     }
 
-    async fn handle_join_room(
-        &self,
-        args: &Value,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let friend_arg = args
-            .get("friend")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ErrorData::invalid_params("friend is required", None))?;
-
-        let (identity, user_id) = {
-            let inner = self.inner.lock().await;
-            let (identity, _) = Self::require_initialized(&inner)?;
-            let user_id = self.config.lock().await.user_id.clone();
-            (identity, user_id)
-        };
-
-        let friend = {
-            let cfg = self.config.lock().await;
-            find_friend_by_alias(&cfg, friend_arg).cloned()
-        }
-        .ok_or_else(|| {
-            ErrorData::invalid_params(format!("Friend '{friend_arg}' not found"), None)
-        })?;
-
-        let addr = friend
-            .cached_self_info
-            .as_ref()
-            .and_then(|info| info.endpoint_addrs.first().cloned())
-            .ok_or_else(|| {
-                ErrorData::internal_error(
-                    "no known endpoint address for this friend; try list_rooms first",
-                    None,
-                )
-            })?;
-
-        let node = NetworkNode::bind(None)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("Bind error: {e}"), None))?;
-
-        let joined = playroom::join_room::<()>(&node, addr, &identity, user_id)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("Join error: {e}"), None))?;
-
+    async fn handle_join_room(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
+        let friend = require_str(args, "friend")?;
+        let joined = self.service.join_room(friend).await.map_err(map_err)?;
         let entries: Vec<(String, playroom::UserPublicKey)> = joined
             .members
             .iter()
             .map(|m| (m.user_id.clone(), m.user_public_key))
             .collect();
-        let display_names = entries
+        let members = entries
             .iter()
             .map(|(id, pk)| playroom::identity::with_key_suffix(id, pk))
-            .collect::<Vec<_>>();
-        let member_list = display_names.join(", ");
-        let room_name = joined.room_name.clone();
-
-        {
-            let mut cfg = self.config.lock().await;
-            let _ = cfg.update_friend_self_info(joined.host_self_info);
-            let _ = cfg.save();
-        }
-
-        let mut inner = self.inner.lock().await;
-        inner.state = McpState::InRoomGuest;
-        inner.guest_conn = Some(GuestConnection {
-            sender: joined.sender,
-            room_name: room_name.clone(),
-            members: joined.members,
-        });
-        inner.peer = Some(context.peer.clone());
-        let _ = context.peer.notify_tool_list_changed().await;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Joined room '{room_name}'! Members: {member_list}"
-        ))]))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(ok_text(format!(
+            "Joined room '{}'! Members: {members}",
+            joined.room_name
+        )))
     }
 
     async fn handle_list_friends(&self) -> Result<CallToolResult, ErrorData> {
-        let cfg = self.config.lock().await;
-        let friends: Vec<&FriendEntry> =
-            cfg.friends.iter().filter(|f| !f.tombstone).collect();
-        if friends.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No friends registered.",
-            )]));
+        let listing = self.service.list_friends().await.map_err(map_err)?;
+        if listing.friends.is_empty() {
+            return Ok(ok_text("No friends registered."));
         }
-
-        let entries: Vec<(String, playroom::UserPublicKey)> = friends
-            .iter()
-            .map(|f| {
-                let key = f.user_public_key.to_bytes().unwrap_or([0u8; 32]);
-                (f.user_id(), key)
-            })
-            .collect();
         let mut lines = vec!["Friends:".to_string()];
-        for (id, pk) in &entries {
-            lines.push(format!("  {}", playroom::identity::with_key_suffix(id, pk)));
+        for f in &listing.friends {
+            lines.push(format!(
+                "  {}",
+                playroom::identity::with_key_suffix(&f.user_id, &f.user_public_key)
+            ));
         }
-
-        Ok(CallToolResult::success(vec![Content::text(
-            lines.join("\n"),
-        )]))
+        Ok(ok_text(lines.join("\n")))
     }
 
     async fn handle_add_friend(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
-        let endpoint_id = args
-            .get("endpoint_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ErrorData::invalid_params("endpoint_id is required", None))?;
-
-        let addr = parse_endpoint_addr(endpoint_id)?;
-
-        let node = NetworkNode::bind(None)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("Bind error: {e}"), None))?;
-        let result = playroom::query_room::<()>(&node, addr)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("Query error: {e}"), None))?;
-        node.close().await;
-
-        let key_hex = UserPublicKeyHex::from_bytes(&result.host_self_info.user_public_key);
-        let display_user_id = result.host_self_info.user_id.clone();
-
-        let mut cfg = self.config.lock().await;
-        cfg.upsert_friend(key_hex);
-        let _ = cfg.update_friend_self_info(result.host_self_info);
-        cfg.save()
-            .map_err(|e| ErrorData::internal_error(format!("Save error: {e}"), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Friend '{display_user_id}' added.",
-        ))]))
+        let endpoint_id = require_str(args, "endpoint_id")?;
+        let info = self.service.add_friend(endpoint_id).await.map_err(map_err)?;
+        Ok(ok_text(format!("Friend '{}' added.", info.user_id)))
     }
 
     async fn handle_list_devices(&self) -> Result<CallToolResult, ErrorData> {
-        let cfg = self.config.lock().await;
-        let devices: Vec<_> = cfg.my_devices.iter().filter(|d| !d.tombstone).collect();
-        if devices.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
+        let listing = self.service.list_devices().await.map_err(map_err)?;
+        if listing.devices.is_empty() {
+            return Ok(ok_text(
                 "No devices registered. Use pair_init / pair_device to pair your devices.",
-            )]));
+            ));
         }
         let mut lines = vec!["Your devices:".to_string()];
-        for d in devices {
-            let short = playroom::identity::short_bytes_from_hex(&d.endpoint_id)
-                .unwrap_or_else(|| "invalid".into());
-            lines.push(format!("  {} (#{short})", d.label));
+        for d in &listing.devices {
+            lines.push(format!("  {} (#{})", d.label, d.endpoint_id_short));
         }
-        Ok(CallToolResult::success(vec![Content::text(lines.join("\n"))]))
+        Ok(ok_text(lines.join("\n")))
     }
 
     async fn handle_pair_init(&self) -> Result<CallToolResult, ErrorData> {
-        let inner = self.inner.lock().await;
-        let (_, handle) = Self::require_initialized(&inner)?;
-        let endpoint_id_bytes = *handle.endpoint_id.as_bytes();
-        let cmd_tx = handle.commands.clone();
-        drop(inner);
-
-        let invite = Invite::generate(endpoint_id_bytes);
-        cmd_tx
-            .send(HostCommand::OpenPairingWindow {
-                secret: invite.secret,
-                ttl: Duration::from_secs(120),
-            })
-            .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "Pairing window open for 120s.\nOn the new device, run pair_device with:\n  invite_code: {invite}",
-        ))]))
+        let result = self.service.pair_init().await.map_err(map_err)?;
+        Ok(ok_text(format!(
+            "Pairing window open for {}s.\nOn the new device, run pair_device with:\n  invite_code: {}",
+            result.ttl_secs, result.invite_code,
+        )))
     }
 
     async fn handle_sync_device(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
-        let endpoint_id = args
-            .get("endpoint_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ErrorData::invalid_params("endpoint_id is required", None))?;
-        let addr = parse_endpoint_addr(endpoint_id)?;
-
-        let identity = {
-            let inner = self.inner.lock().await;
-            let (identity, _) = Self::require_initialized(&inner)?;
-            identity
-        };
-
-        let node = NetworkNode::bind(None)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("Bind error: {e}"), None))?;
-
-        let outcome = {
-            let mut cfg = self.config.lock().await;
-            let outcome = playroom::sync_with_peer(&node, addr, &identity, &mut cfg)
-                .await
-                .map_err(|e| ErrorData::internal_error(format!("Sync error: {e}"), None))?;
-            if outcome.changed {
-                let _ = cfg.save();
-            }
-            outcome
-        };
-        node.close().await;
-
-        let msg = if outcome.changed {
+        let endpoint_id = require_str(args, "endpoint_id")?;
+        let result = self.service.sync_device(endpoint_id).await.map_err(map_err)?;
+        let msg = if result.changed {
             "Sync completed with changes."
         } else {
             "Sync completed (no changes)."
         };
-        Ok(CallToolResult::success(vec![Content::text(msg)]))
+        Ok(ok_text(msg))
     }
 
     async fn handle_send_message(&self, args: &Value) -> Result<CallToolResult, ErrorData> {
-        let content = args
-            .get("content")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ErrorData::invalid_params("content is required", None))?;
-
-        let mut inner = self.inner.lock().await;
-        match inner.state {
-            McpState::InRoomHost => {
-                let cmd_tx = inner
-                    .host_handle
-                    .as_ref()
-                    .ok_or_else(|| ErrorData::internal_error("no host", None))?
-                    .commands
-                    .clone();
-                drop(inner);
-                cmd_tx
-                    .send(HostCommand::Chat {
-                        content: content.to_string(),
-                    })
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-                Ok(CallToolResult::success(vec![Content::text("Message sent.")]))
-            }
-            McpState::InRoomGuest => {
-                if let Some(conn) = &mut inner.guest_conn {
-                    conn.sender
-                        .send(&ClientMessage::<()>::Chat {
-                            content: content.to_string(),
-                        })
-                        .await
-                        .map_err(|e| ErrorData::internal_error(format!("Send error: {e}"), None))?;
-                    Ok(CallToolResult::success(vec![Content::text("Message sent.")]))
-                } else {
-                    Err(ErrorData::internal_error("Not connected to a room", None))
-                }
-            }
-            _ => Err(ErrorData::invalid_params("Not in a room", None)),
-        }
+        let content = require_str(args, "content")?;
+        self.service.send_message(content).await.map_err(map_err)?;
+        Ok(ok_text("Message sent."))
     }
 
-    async fn handle_leave_room(
-        &self,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let mut inner = self.inner.lock().await;
-        match inner.state {
-            McpState::InRoomHost => {
-                let cmd_tx = inner
-                    .host_handle
-                    .as_ref()
-                    .ok_or_else(|| ErrorData::internal_error("no host", None))?
-                    .commands
-                    .clone();
-                inner.state = McpState::MainMenu;
-                inner.peer = Some(context.peer.clone());
-                drop(inner);
-
-                cmd_tx
-                    .send(HostCommand::CloseRoom)
-                    .await
-                    .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
-
-                let _ = context.peer.notify_tool_list_changed().await;
-                Ok(CallToolResult::success(vec![Content::text("Room closed.")]))
-            }
-            McpState::InRoomGuest => {
-                if let Some(mut conn) = inner.guest_conn.take() {
-                    let _ = conn.sender.send(&ClientMessage::<()>::Leave).await;
-                }
-                inner.state = McpState::MainMenu;
-                inner.peer = Some(context.peer.clone());
-                drop(inner);
-
-                let _ = context.peer.notify_tool_list_changed().await;
-                Ok(CallToolResult::success(vec![Content::text(
-                    "Left the room.",
-                )]))
-            }
-            _ => Err(ErrorData::invalid_params("Not in a room", None)),
-        }
+    async fn handle_leave_room(&self) -> Result<CallToolResult, ErrorData> {
+        let was_host = self.service.state().await == AppState::InRoomHost;
+        self.service.leave_room().await.map_err(map_err)?;
+        Ok(ok_text(if was_host {
+            "Room closed."
+        } else {
+            "Left the room."
+        }))
     }
 }
 
@@ -727,21 +323,10 @@ impl ServerHandler for PlaytableMcpHandler {
     ) -> impl std::future::Future<Output = Result<InitializeResult, ErrorData>> + Send + '_ {
         async move {
             context.peer.set_peer_info(request);
-            let mut inner = self.inner.lock().await;
-            inner.peer = Some(context.peer.clone());
-            // 起動時に config が既に初期化済みなら MainMenu へ自動遷移し、RoomHost を起動
-            if inner.state == McpState::Uninitialized && inner.host_handle.is_none() {
-                let cfg_valid = self.config.lock().await.has_valid_user_id();
-                if cfg_valid {
-                    drop(inner);
-                    let identity = Arc::new(
-                        UserIdentity::load_or_generate().map_err(|e| {
-                            ErrorData::internal_error(format!("identity: {e}"), None)
-                        })?,
-                    );
-                    self.start_room_host(identity).await?;
-                }
-            }
+            self.set_peer(context.peer.clone()).await;
+            // event forwarder を起動（冪等）
+            // self は &self なので Arc に戻すために一旦この経路は取れない。
+            // 代わりに initialize 時にグローバルに1回だけ起動する仕組みを作る。
             Ok(self.get_info())
         }
     }
@@ -752,8 +337,8 @@ impl ServerHandler for PlaytableMcpHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, ErrorData>> + Send + '_ {
         async move {
-            let inner = self.inner.lock().await;
-            let tools = Self::tools_for_state(&inner.state);
+            let state = self.service.state().await;
+            let tools = Self::tools_for_state(&state);
             Ok(ListToolsResult {
                 tools,
                 next_cursor: None,
@@ -765,7 +350,7 @@ impl ServerHandler for PlaytableMcpHandler {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
+        _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, ErrorData>> + Send + '_ {
         async move {
             let name: &str = &request.name;
@@ -776,18 +361,18 @@ impl ServerHandler for PlaytableMcpHandler {
                 .unwrap_or(serde_json::Value::Null);
 
             match name {
-                "create_user" => self.handle_create_user(&args, context).await,
-                "pair_device" => self.handle_pair_device(&args, context).await,
+                "create_user" => self.handle_create_user(&args).await,
+                "pair_device" => self.handle_pair_device(&args).await,
                 "list_rooms" => self.handle_list_rooms().await,
-                "create_room" => self.handle_create_room(&args, context).await,
-                "join_room" => self.handle_join_room(&args, context).await,
+                "create_room" => self.handle_create_room(&args).await,
+                "join_room" => self.handle_join_room(&args).await,
                 "list_friends" => self.handle_list_friends().await,
                 "add_friend" => self.handle_add_friend(&args).await,
                 "list_devices" => self.handle_list_devices().await,
                 "pair_init" => self.handle_pair_init().await,
                 "sync_device" => self.handle_sync_device(&args).await,
                 "send_message" => self.handle_send_message(&args).await,
-                "leave_room" => self.handle_leave_room(context).await,
+                "leave_room" => self.handle_leave_room().await,
                 _ => Err(ErrorData::method_not_found::<CallToolRequestMethod>()),
             }
         }
@@ -798,22 +383,63 @@ impl ServerHandler for PlaytableMcpHandler {
     }
 }
 
-// ── Helper functions ──
+// ── Helpers ──
 
-fn parse_endpoint_addr(endpoint_id_hex: &str) -> Result<EndpointAddr, ErrorData> {
-    let bytes = hex::decode(endpoint_id_hex)
-        .map_err(|e| ErrorData::invalid_params(format!("Invalid hex: {e}"), None))?;
-    if bytes.len() != 32 {
-        return Err(ErrorData::invalid_params(
-            "EndpointId must be 32 bytes (64 hex chars)",
-            None,
-        ));
+fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ErrorData> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| ErrorData::invalid_params(format!("{key} is required"), None))
+}
+
+fn map_err(e: AppError) -> ErrorData {
+    match e {
+        AppError::InvalidArg(s) => ErrorData::invalid_params(s, None),
+        AppError::NotInitialized | AppError::AlreadyInitialized | AppError::NotInRoom => {
+            ErrorData::invalid_params(e.to_string(), None)
+        }
+        AppError::Internal(s) => ErrorData::internal_error(s, None),
     }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&bytes);
-    let eid = EndpointId::from_bytes(&arr)
-        .map_err(|e| ErrorData::invalid_params(format!("Invalid key: {e}"), None))?;
-    Ok(EndpointAddr::from(eid))
+}
+
+fn ok_text<S: Into<String>>(s: S) -> CallToolResult {
+    CallToolResult::success(vec![Content::text(s.into())])
+}
+
+async fn notify_log(peer: &Peer<RoleServer>, message: &str) {
+    let _ = peer
+        .notify_logging_message(LoggingMessageNotificationParam {
+            level: LoggingLevel::Info,
+            logger: Some("playroom".to_string()),
+            data: serde_json::json!(message),
+        })
+        .await;
+}
+
+fn format_room_event(event: &RoomEvent) -> String {
+    match event {
+        RoomEvent::MemberJoined { user_id, .. } => format!("* {user_id} joined the room"),
+        RoomEvent::MemberLeft { user_id, .. } => format!("* {user_id} left the room"),
+        RoomEvent::ChatReceived { from, content } => format!("[chat] {from}: {content}"),
+        RoomEvent::RoomCreated { name } => format!("* Room '{name}' created"),
+        RoomEvent::RoomClosed => "* Room closed".to_string(),
+        RoomEvent::PairingWindowOpened => "* Pairing window opened".to_string(),
+        RoomEvent::PairingWindowClosed => "* Pairing window closed".to_string(),
+        RoomEvent::PairingCompleted { device_label, .. } => {
+            format!("* Paired with new device: {device_label}")
+        }
+        RoomEvent::SyncCompleted { .. } => "* Sync completed".to_string(),
+    }
+}
+
+fn format_host_message(msg: &HostMessage) -> Option<String> {
+    match msg {
+        HostMessage::Chat { from, content } => Some(format!("[chat] {from}: {content}")),
+        HostMessage::MemberJoined(info) => Some(format!("* {} joined the room", info.user_id)),
+        HostMessage::MemberLeft { user_id, .. } => Some(format!("* {user_id} left the room")),
+        HostMessage::RoomClosed => Some("* Room has been closed by the host".to_string()),
+        HostMessage::Rejected { reason } => Some(format!("Rejected: {reason}")),
+        _ => None,
+    }
 }
 
 fn make_tool(name: &str, description: &str, input_schema: Arc<JsonObject>) -> Tool {
@@ -857,37 +483,9 @@ fn json_schema_obj(props: &[(&str, &str, &str)]) -> Arc<JsonObject> {
     )
 }
 
-fn find_friend_by_alias<'a>(config: &'a AppConfig, alias: &str) -> Option<&'a FriendEntry> {
-    if let Some(f) = config.friends.iter().find(|f| {
-        !f.tombstone
-            && f.cached_self_info
-                .as_ref()
-                .map(|i| i.user_id == alias)
-                .unwrap_or(false)
-    }) {
-        return Some(f);
+/// `run()` から Arc<handler> を使って forwarder を起動できるようにする公開ヘルパー。
+impl PlaytableMcpHandler {
+    pub async fn spawn_forwarder(self: &Arc<Self>) {
+        self.clone().start_event_forwarder().await;
     }
-    config
-        .friends
-        .iter()
-        .find(|f| !f.tombstone && f.user_public_key.0.starts_with(alias))
-}
-
-async fn query_friend_room(friend: &FriendEntry) -> anyhow::Result<Option<RoomSummary>> {
-    let addr = friend
-        .cached_self_info
-        .as_ref()
-        .and_then(|info| info.endpoint_addrs.first().cloned())
-        .ok_or_else(|| anyhow::anyhow!("no known endpoint address"))?;
-
-    let node = NetworkNode::bind(None).await?;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        playroom::query_room::<()>(&node, addr),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("query timeout"))??;
-    node.close().await;
-
-    Ok(result.room)
 }
